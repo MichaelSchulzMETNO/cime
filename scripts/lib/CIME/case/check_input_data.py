@@ -22,9 +22,9 @@ def _download_checksum_file(rundir):
     chksum_found = False
     # download and merge all available chksum files.
     while protocol is not None:
-        protocol, address, user, passwd, chksum_file = inputdata.get_next_server()
+        protocol, address, user, passwd, chksum_file,_ = inputdata.get_next_server()
         if protocol not in vars(CIME.Servers):
-            logger.warning("Client protocol {} not enabled".format(protocol))
+            logger.info("Client protocol {} not enabled".format(protocol))
             continue
         logger.info("Using protocol {} with user {} and passwd {}".format(protocol, user, passwd))
         if protocol == "svn":
@@ -37,6 +37,8 @@ def _download_checksum_file(rundir):
             server = CIME.Servers.WGET.wget_login(address, user, passwd)
         else:
             expect(False, "Unsupported inputdata protocol: {}".format(protocol))
+        if not server:
+            continue
 
         if chksum_file:
             chksum_found = True
@@ -48,7 +50,7 @@ def _download_checksum_file(rundir):
         full_path = os.path.join(rundir, local_chksum_file)
         new_file = full_path + '.raw'
         protocol = type(server).__name__
-        logging.info("Trying to download file: '{}' to path '{}' using {} protocol.".format(rel_path, new_file, protocol))
+        logger.info("Trying to download file: '{}' to path '{}' using {} protocol.".format(rel_path, new_file, protocol))
         tmpfile = None
         if os.path.isfile(full_path):
             tmpfile = full_path+".tmp"
@@ -106,7 +108,7 @@ def _merge_chksum_files(new_file, old_file):
 
 
 
-def _download_if_in_repo(server, input_data_root, rel_path, isdirectory=False):
+def _download_if_in_repo(server, input_data_root, rel_path, isdirectory=False, ic_filepath=None):
     """
     Return True if successfully downloaded
     server is an object handle of type CIME.Servers
@@ -117,9 +119,10 @@ def _download_if_in_repo(server, input_data_root, rel_path, isdirectory=False):
     """
     if not (rel_path or server.fileexists(rel_path)):
         return False
-
     full_path = os.path.join(input_data_root, rel_path)
-    logging.info("Trying to download file: '{}' to path '{}' using {} protocol.".format(rel_path, full_path, type(server).__name__))
+    if ic_filepath:
+        full_path = full_path.replace(ic_filepath, "/")
+    logger.info("Trying to download file: '{}' to path '{}' using {} protocol.".format(rel_path, full_path, type(server).__name__))
     # Make sure local path exists, create if it does not
     if isdirectory or full_path.endswith(os.sep):
         if not os.path.exists(full_path):
@@ -183,12 +186,12 @@ def _downloadfromserver(case, input_data_root, data_list_dir):
         input_data_root = case.get_value('DIN_LOC_ROOT')
 
     while not success and protocol is not None:
-        protocol, address, user, passwd, _ = inputdata.get_next_server()
+        protocol, address, user, passwd, _, ic_filepath = inputdata.get_next_server()
         logger.info("Checking server {} with protocol {}".format(address, protocol))
         success = case.check_input_data(protocol=protocol, address=address, download=True,
                                         input_data_root=input_data_root,
                                         data_list_dir=data_list_dir,
-                                        user=user, passwd=passwd)
+                                        user=user, passwd=passwd, ic_filepath=ic_filepath)
     return success
 
 def stage_refcase(self, input_data_root=None, data_list_dir=None):
@@ -243,6 +246,7 @@ def stage_refcase(self, input_data_root=None, data_list_dir=None):
         for rpointerfile in glob.iglob(os.path.join("{}","*rpointer*").format(refdir)):
             logger.info("Copy rpointer {}".format(rpointerfile))
             safe_copy(rpointerfile, rundir)
+            os.chmod(os.path.join(rundir, os.path.basename(rpointerfile)), 0o644)
         expect(rpointerfile,"Reference case directory {} does not contain any rpointer files".format(refdir))
         # link everything else
 
@@ -263,7 +267,7 @@ def stage_refcase(self, input_data_root=None, data_list_dir=None):
     return True
 
 def check_input_data(case, protocol="svn", address=None, input_data_root=None, data_list_dir="Buildconf",
-                     download=False, user=None, passwd=None, chksum=False):
+                     download=False, user=None, passwd=None, chksum=False, ic_filepath=None):
     """
     For a given case check for the relevant input data as specified in data_list_dir/*.input_data_list
     in the directory input_data_root, if not found optionally download it using the servers specified
@@ -275,7 +279,7 @@ def check_input_data(case, protocol="svn", address=None, input_data_root=None, d
     rundir = case.get_value("RUNDIR")
     # Fill in defaults as needed
     input_data_root = case.get_value("DIN_LOC_ROOT") if input_data_root is None else input_data_root
-    input_ic_root = case.get_value("DIN_LOC_IC")
+    input_ic_root = case.get_value("DIN_LOC_IC", resolved=True)
     expect(os.path.isdir(data_list_dir), "Invalid data_list_dir directory: '{}'".format(data_list_dir))
 
     data_list_files = find_files(data_list_dir, "*.input_data_list")
@@ -285,7 +289,7 @@ def check_input_data(case, protocol="svn", address=None, input_data_root=None, d
     no_files_missing = True
     if download:
         if protocol not in vars(CIME.Servers):
-            logger.warning("Client protocol {} not enabled".format(protocol))
+            logger.info("Client protocol {} not enabled".format(protocol))
             return False
         logger.info("Using protocol {} with user {} and passwd {}".format(protocol, user, passwd))
         if protocol == "svn":
@@ -299,10 +303,10 @@ def check_input_data(case, protocol="svn", address=None, input_data_root=None, d
         else:
             expect(False, "Unsupported inputdata protocol: {}".format(protocol))
         if not server:
-            return False
+            return None
 
     for data_list_file in data_list_files:
-        logging.info("Loading input file list: '{}'".format(data_list_file))
+        logger.info("Loading input file list: '{}'".format(data_list_file))
         with open(data_list_file, "r") as fd:
             lines = fd.readlines()
 
@@ -312,31 +316,37 @@ def check_input_data(case, protocol="svn", address=None, input_data_root=None, d
             if (line and not line.startswith("#")):
                 tokens = line.split('=')
                 description, full_path = tokens[0].strip(), tokens[1].strip()
-                if description.endswith('datapath'):
+                if description.endswith('datapath') or description.endswith('data_path'):
                     continue
                 if(full_path):
                     # expand xml variables
                     full_path = case.get_resolved_value(full_path)
-                    if input_data_root in full_path:
+                    rel_path = full_path
+                    if input_ic_root and input_ic_root in full_path \
+                       and ic_filepath:
+                        rel_path = full_path.replace(input_ic_root, ic_filepath)
+                        use_ic_path = True
+                    elif input_data_root in full_path:
                         rel_path  = full_path.replace(input_data_root, "")
                     elif input_ic_root and \
                          (input_ic_root not in input_data_root and input_ic_root in full_path):
-                        rel_path  = full_path.replace(input_ic_root, "prod")
+                        if ic_filepath:
+                            rel_path  = full_path.replace(input_ic_root, ic_filepath)
                         use_ic_path = True
 
                     model = os.path.basename(data_list_file).split('.')[0]
 
-                    if ("/" in rel_path and rel_path == full_path):
+                    if ("/" in rel_path and rel_path == full_path and not full_path.startswith('unknown')):
                         # User pointing to a file outside of input_data_root, we cannot determine
                         # rel_path, and so cannot download the file. If it already exists, we can
                         # proceed
                         if not os.path.exists(full_path):
-                            logging.warning("Model {} missing file {} = '{}'".format(model, description, full_path))
+                            print("Model {} missing file {} = '{}'".format(model, description, full_path))
                             if download:
-                                logging.warning("    Cannot download file since it lives outside of the input_data_root '{}'".format(input_data_root))
+                                logger.warning("    Cannot download file since it lives outside of the input_data_root '{}'".format(input_data_root))
                             no_files_missing = False
                         else:
-                            logging.debug("  Found input file: '{}'".format(full_path))
+                            logger.debug("  Found input file: '{}'".format(full_path))
                     else:
                         # There are some special values of rel_path that
                         # we need to ignore - some of the component models
@@ -346,28 +356,31 @@ def check_input_data(case, protocol="svn", address=None, input_data_root=None, d
                         # value and ignore it (perhaps with a warning)
                         isdirectory=rel_path.endswith(os.sep)
 
-                        if ("/" in rel_path and not os.path.exists(full_path)):
-                            logger.warning("  Model {} missing file {} = '{}'".format(model, description, full_path))
-                            no_files_missing = False
+                        if ("/" in rel_path and not os.path.exists(full_path) and not full_path.startswith('unknown')):
+                            print("Model {} missing file {} = '{}'".format(model, description, full_path))
                             if (download):
                                 if use_ic_path:
-                                    no_files_missing = _download_if_in_repo(server,
-                                                                            input_ic_root[:-4], rel_path.strip(os.sep),
-                                                                            isdirectory=isdirectory)
+                                    success = _download_if_in_repo(server,
+                                                                            input_ic_root, rel_path.strip(os.sep),
+                                                                            isdirectory=isdirectory, ic_filepath=ic_filepath)
                                 else:
-                                    no_files_missing = _download_if_in_repo(server,
+                                    success = _download_if_in_repo(server,
                                                                             input_data_root, rel_path.strip(os.sep),
-                                                                            isdirectory=isdirectory)
-                                if no_files_missing and chksum:
+                                                                            isdirectory=isdirectory, ic_filepath=ic_filepath)
+                                if not success:
+                                    no_files_missing = False
+                                if success and chksum:
                                     verify_chksum(input_data_root, rundir, rel_path.strip(os.sep), isdirectory)
+                            else:
+                                no_files_missing = False
                         else:
                             if chksum:
                                 verify_chksum(input_data_root, rundir, rel_path.strip(os.sep), isdirectory)
                                 logger.info("Chksum passed for file {}".format(os.path.join(input_data_root,rel_path)))
-                            logging.debug("  Already had input file: '{}'".format(full_path))
+                            logger.debug("  Already had input file: '{}'".format(full_path))
                 else:
                     model = os.path.basename(data_list_file).split('.')[0]
-                    logging.warning("Model {} no file specified for {}".format(model, description))
+                    logger.warning("Model {} no file specified for {}".format(model, description))
 
     return no_files_missing
 

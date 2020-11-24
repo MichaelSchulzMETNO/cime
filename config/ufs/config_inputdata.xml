@@ -8,16 +8,13 @@
   <!-- it will be searched for filename and chksum of each downloaded file.  -->
   <!-- see the file ftp://ftp.cgd.ucar.edu/cesm/inputdata_chksum.dat for proper format. -->
 
+  <!-- server for sample data and fixed files -->
   <server>
     <comment>ftp site for ufs release</comment>
     <protocol>ftp</protocol>
     <address>ftp.emc.ncep.noaa.gov/EIB/UFS/</address>
     <user>anonymous</user>
     <password>user@example.edu</password>
-  </server>
-  <server>
-    <comment>NOMADS ftp site for initial conditions</comment>
-    <protocol>wget</protocol>
-    <address>nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/</address>
+    <ic_filepath>/inputdata/</ic_filepath>
   </server>
 </inputdata>

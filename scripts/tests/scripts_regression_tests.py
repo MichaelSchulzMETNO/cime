@@ -22,7 +22,7 @@ import stat as osstat
 
 import collections
 
-from CIME.utils import run_cmd, run_cmd_no_fail, get_lids, get_current_commit, safe_copy, CIMEError, get_cime_root
+from CIME.utils import run_cmd, run_cmd_no_fail, get_lids, get_current_commit, safe_copy, CIMEError, get_cime_root, Timeout
 import get_tests
 import CIME.test_scheduler, CIME.wait_for_tests
 from  CIME.test_scheduler import TestScheduler
@@ -46,6 +46,7 @@ NO_BATCH    = False
 NO_CMAKE    = False
 TEST_ROOT   = None
 NO_TEARDOWN = False
+NO_FORTRAN_RUN      = False
 
 os.environ["CIME_GLOBAL_WALLTIME"] = "0:05:00"
 
@@ -81,7 +82,6 @@ def assert_test_status(test_obj, test_name, test_status_obj, test_phase, expecte
 def verify_perms(test_obj, root_dir):
 ###############################################################################
     for root, dirs, files in os.walk(root_dir):
-
         for filename in files:
             full_path = os.path.join(root, filename)
             st = os.stat(full_path)
@@ -98,6 +98,13 @@ def verify_perms(test_obj, root_dir):
             test_obj.assertTrue(st.st_mode & osstat.S_IXGRP, msg="dir {} is not group executable".format(full_path))
             test_obj.assertTrue(st.st_mode & osstat.S_IROTH, msg="dir {} is not world readable".format(full_path))
             test_obj.assertTrue(st.st_mode & osstat.S_IXOTH, msg="dir {} is not world executable".format(full_path))
+
+###############################################################################
+def get_casedir(test_obj, case_fragment, all_cases):
+###############################################################################
+    potential_matches = [item for item in all_cases if case_fragment in item]
+    test_obj.assertTrue(len(potential_matches) == 1, "Ambiguous casedir selection for {}, found  {}  among  {}".format(case_fragment, potential_matches, all_cases))
+    return potential_matches[0]
 
 ###############################################################################
 class A_RunUnitTests(unittest.TestCase):
@@ -153,6 +160,47 @@ class A_RunUnitTests(unittest.TestCase):
                         run_cmd_assert_result(self, 'PYTHONPATH={}:$PYTHONPATH python -m doctest {} 2>&1'.format(LIB_DIR, filepath), from_dir=LIB_DIR)
                     else:
                         print("{} has no doctests".format(filepath))
+
+###############################################################################
+class C_TestGridGeneration(unittest.TestCase):
+###############################################################################
+    @classmethod
+    def setUpClass(cls):
+        cls._do_teardown = []
+        cls._testroot = os.path.join(TEST_ROOT, "TestGridGeneration")
+        cls._testdirs = []
+
+    def test_gen_domain(self):
+        if CIME.utils.get_model() != "e3sm":
+            self.skipTest("Skipping gen_domain test. Depends on E3SM tools")
+        cime_root = get_cime_root()
+        inputdata = MACHINE.get_value("DIN_LOC_ROOT")
+
+        tool_name = "test_gen_domain"
+        tool_location = os.path.join(cime_root, "tools", "mapping", "gen_domain_files", "test_gen_domain.sh")
+        args = "--cime_root={} --inputdata_root={}".format(cime_root, inputdata)
+
+        cls = self.__class__
+        test_dir = os.path.join(cls._testroot, tool_name)
+        cls._testdirs.append(test_dir)
+        os.makedirs(test_dir)
+        run_cmd_assert_result(self, "{} {}".format(tool_location, args), from_dir=test_dir)
+        cls._do_teardown.append(test_dir)
+
+    @classmethod
+    def tearDownClass(cls):
+        do_teardown = len(cls._do_teardown) > 0 and sys.exc_info() == (None, None, None) and not NO_TEARDOWN
+        teardown_root = True
+        for tfile in cls._testdirs:
+            if tfile not in cls._do_teardown:
+                print("Detected failed test or user request no teardown")
+                print("Leaving case directory : %s"%tfile)
+                teardown_root = False
+            elif do_teardown:
+                shutil.rmtree(tfile)
+
+        if teardown_root and do_teardown:
+            shutil.rmtree(cls._testroot)
 
 ###############################################################################
 def make_fake_teststatus(path, testname, status, phase):
@@ -300,6 +348,11 @@ class J_TestCreateNewcase(unittest.TestCase):
         cls._testdirs = []
         cls._do_teardown = []
         cls._testroot = os.path.join(TEST_ROOT, 'TestCreateNewcase')
+        cls._root_dir = os.getcwd()
+
+    def tearDown(self):
+        cls = self.__class__
+        os.chdir(cls._root_dir)
 
     def test_a_createnewcase(self):
         cls = self.__class__
@@ -410,6 +463,7 @@ class J_TestCreateNewcase(unittest.TestCase):
                               % (SCRIPT_DIR, args),from_dir=SCRIPT_DIR)
 
         self.assertTrue(os.path.isfile(os.path.join(testdir,"SourceMods","src.drv","somefile.F90")), msg="User_mods SourceMod missing")
+
         with open(os.path.join(testdir,"user_nl_cpl"),"r") as fd:
             contents = fd.read()
             self.assertTrue("a different cpl test option" in contents, msg="User_mods contents of user_nl_cpl missing")
@@ -646,7 +700,6 @@ class J_TestCreateNewcase(unittest.TestCase):
         and make sure they are the same by comparing the namelist files in CaseDocs.
         Ignore the modelio files and clean the directory names out first.
         """
-
         cls = self.__class__
 
         testdir1 = os.path.join(cls._testroot, 'testcreatenewcase_user_compset')
@@ -715,7 +768,6 @@ class J_TestCreateNewcase(unittest.TestCase):
         cls._do_teardown.append(testdir1)
         cls._do_teardown.append(testdir2)
 
-
     def test_k_append_config(self):
         machlist_before = MACHINE.list_available_machines()
         self.assertEqual(len(machlist_before)>1, True, msg="Problem reading machine list")
@@ -728,6 +780,62 @@ class J_TestCreateNewcase(unittest.TestCase):
         self.assertEqual(len(machlist_after)-len(machlist_before), 1, msg="Not able to append config_machines.xml {} {}".format(len(machlist_after), len(machlist_before)))
         self.assertEqual("mymachine" in machlist_after, True, msg="Not able to append config_machines.xml")
 
+    def test_ka_createnewcase_extra_machines_dir(self):
+        # Test that we pick up changes in both config_machines.xml and
+        # config_compilers.xml in a directory specified with the --extra-machines-dir
+        # argument to create_newcase.
+        cls = self.__class__
+        casename = 'testcreatenewcase_extra_machines_dir'
+
+        # Setup: stage some xml files in a temporary directory
+        extra_machines_dir = os.path.join(cls._testroot, '{}_machine_config'.format(casename))
+        os.makedirs(extra_machines_dir)
+        cls._do_teardown.append(extra_machines_dir)
+        newmachfile = os.path.join(get_cime_root(),"config",
+                                   "xml_schemas","config_machines_template.xml")
+        safe_copy(newmachfile, os.path.join(extra_machines_dir, "config_machines.xml"))
+        config_compilers_text = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<config_compilers version="2.0">
+<compiler MACH="mymachine">
+  <NETCDF_PATH>/my/netcdf/path</NETCDF_PATH>
+</compiler>
+</config_compilers>
+"""
+        config_compilers_path = os.path.join(extra_machines_dir, "config_compilers.xml")
+        with open(config_compilers_path, "w") as config_compilers:
+            config_compilers.write(config_compilers_text)
+
+        # Create the case
+        testdir = os.path.join(cls._testroot, casename)
+        if os.path.exists(testdir):
+            shutil.rmtree(testdir)
+        # In the following, note that 'mymachine' is the machine name defined in
+        # config_machines_template.xml
+        args = (" --case {testdir} --compset X --mach mymachine"
+                " --output-root {testroot} --non-local"
+                " --extra-machines-dir {extra_machines_dir}".format(
+                    testdir=testdir, testroot=cls._testroot,
+                    extra_machines_dir=extra_machines_dir))
+        if CIME.utils.get_cime_default_driver() == "nuopc":
+            args += " --res f19_g17 "
+        else:
+            args += " --res f19_g16 "
+        run_cmd_assert_result(self, "./create_newcase {}".format(args),
+                              from_dir=SCRIPT_DIR)
+        cls._do_teardown.append(testdir)
+
+        # Run case.setup
+        run_cmd_assert_result(self, "./case.setup",
+                              from_dir=testdir)
+
+        # Make sure Macros file contains expected text
+        macros_file_name = os.path.join(testdir, "Macros.make")
+        self.assertTrue(os.path.isfile(macros_file_name))
+        with open(macros_file_name) as macros_file:
+            macros_contents = macros_file.read()
+        expected_re = re.compile("NETCDF_PATH.*/my/netcdf/path")
+        self.assertTrue(expected_re.search(macros_contents))
 
     def test_m_createnewcase_alternate_drivers(self):
         # Test that case.setup runs for nuopc and moab drivers
@@ -801,10 +909,8 @@ class J_TestCreateNewcase(unittest.TestCase):
                     shutil.rmtree(tfile)
                 except BaseException:
                     print("Could not remove directory {}".format(tfile))
-        if rmtestroot:
+        if rmtestroot and do_teardown:
             shutil.rmtree(cls._testroot)
-
-
 
 ###############################################################################
 class M_TestWaitForTests(unittest.TestCase):
@@ -1087,11 +1193,14 @@ class TestCreateTestCommon(unittest.TestCase):
         self._testroot          = TEST_ROOT
         self._hasbatch          = MACHINE.has_batch_system() and not NO_BATCH
         self._do_teardown       = not NO_TEARDOWN
+        self._root_dir          = os.getcwd()
 
     ###########################################################################
     def tearDown(self):
     ###########################################################################
         kill_subprocesses()
+
+        os.chdir(self._root_dir)
 
         if (self._unset_proxy):
             del os.environ["http_proxy"]
@@ -1127,10 +1236,14 @@ class TestCreateTestCommon(unittest.TestCase):
     ###########################################################################
     def _create_test(self, extra_args, test_id=None, pre_run_errors=False, run_errors=False, env_changes=""):
     ###########################################################################
+        """
+        Convenience wrapper around create_test. Returns list of full paths to created cases. If multiple cases,
+        the order of the returned list is not guaranteed to match the order of the arguments.
+        """
         # All stub model not supported in nuopc driver
         driver = CIME.utils.get_cime_default_driver()
-        if driver == 'nuopc':
-            extra_args.append(" ^SMS.T42_T42.S")
+        if driver == 'nuopc' and 'cime_developer' in extra_args:
+            extra_args.append(" ^SMS_Ln3.T42_T42.S ^PRE.f19_f19.ADESP_TEST ^PRE.f19_f19.ADESP ^DAE.ww3a.ADWAV")
 
         test_id = "{}-{}".format(self._baseline_name, CIME.utils.get_timestamp()) if test_id is None else test_id
         extra_args.append("-t {}".format(test_id))
@@ -1143,23 +1256,33 @@ class TestCreateTestCommon(unittest.TestCase):
             extra_args.append("--mpilib={}".format(TEST_MPILIB))
         extra_args.append("--test-root={0} --output-root={0}".format(self._testroot))
 
-        full_run = (set(extra_args) & set(["-n", "--namelist-only", "--no-setup", "--no-build"])) == set()
+        full_run = (set(extra_args) & set(["-n", "--namelist-only", "--no-setup", "--no-build", "--no-run"])) == set()
 
         if self._hasbatch:
             expected_stat = 0 if not pre_run_errors else CIME.utils.TESTS_FAILED_ERR_CODE
         else:
             expected_stat = 0 if not pre_run_errors and not run_errors else CIME.utils.TESTS_FAILED_ERR_CODE
 
-        run_cmd_assert_result(self, "{} {}/create_test {}".format(env_changes, SCRIPT_DIR, " ".join(extra_args)),
-                              expected_stat=expected_stat)
+        output = run_cmd_assert_result(self, "{} {}/create_test {}".format(env_changes, SCRIPT_DIR, " ".join(extra_args)),
+                                       expected_stat=expected_stat)
+        cases = []
+        for line in output.splitlines():
+            if "Case dir:" in line:
+                casedir = line.split()[-1]
+                self.assertTrue(os.path.isdir(casedir), msg="Missing casedir {}".format(casedir))
+                cases.append(casedir)
+
+        self.assertTrue(len(cases) > 0, "create_test made no cases")
 
         if full_run:
             self._wait_for_tests(test_id, expect_works=(not pre_run_errors and not run_errors))
 
+        return cases[0] if len(cases) == 1 else cases
+
     ###########################################################################
-    def _wait_for_tests(self, test_id, expect_works=True):
+    def _wait_for_tests(self, test_id, expect_works=True, always_wait=False):
     ###########################################################################
-        if self._hasbatch:
+        if self._hasbatch or always_wait:
             timeout_arg = "--timeout={}".format(GLOBAL_TIMEOUT) if GLOBAL_TIMEOUT is not None else ""
             expected_stat = 0 if expect_works else CIME.utils.TESTS_FAILED_ERR_CODE
             run_cmd_assert_result(self, "{}/wait_for_tests {} *{}/TestStatus".format(TOOLS_DIR, timeout_arg, test_id),
@@ -1573,16 +1696,15 @@ class T_TestRunRestart(TestCreateTestCommon):
     ###########################################################################
     def test_run_restart(self):
     ###########################################################################
+        if (NO_FORTRAN_RUN):
+            self.skipTest("Skipping fortran test")
         driver = CIME.utils.get_cime_default_driver()
         if driver == "mct":
             walltime="00:15:00"
         else:
             walltime="00:30:00"
 
-        self._create_test(["--walltime "+walltime,"NODEFAIL_P1.f09_g16.X"], test_id=self._baseline_name)
-
-        casedir = os.path.join(self._testroot,
-                               "{}.{}".format(CIME.utils.get_full_test_name("NODEFAIL_P1.f09_g16.X", machine=self._machine, compiler=self._compiler), self._baseline_name))
+        casedir = self._create_test(["--walltime "+walltime,"NODEFAIL_P1.f09_g16.X"], test_id=self._baseline_name)
         rundir = run_cmd_no_fail("./xmlquery RUNDIR --value", from_dir=casedir)
         fail_sentinel = os.path.join(rundir, "FAIL_SENTINEL")
         self.assertTrue(os.path.exists(fail_sentinel), msg="Missing %s" % fail_sentinel)
@@ -1592,16 +1714,15 @@ class T_TestRunRestart(TestCreateTestCommon):
     ###########################################################################
     def test_run_restart_too_many_fails(self):
     ###########################################################################
+        if (NO_FORTRAN_RUN):
+            self.skipTest("Skipping fortran test")
         driver = CIME.utils.get_cime_default_driver()
         if driver == "mct":
             walltime="00:15:00"
         else:
             walltime="00:30:00"
 
-        self._create_test(["--walltime "+walltime,"NODEFAIL_P1.f09_g16.X"], test_id=self._baseline_name, env_changes="NODEFAIL_NUM_FAILS=5", run_errors=True)
-
-        casedir = os.path.join(self._testroot,
-                               "{}.{}".format(CIME.utils.get_full_test_name("NODEFAIL_P1.f09_g16.X", machine=self._machine, compiler=self._compiler), self._baseline_name))
+        casedir = self._create_test(["--walltime "+walltime,"NODEFAIL_P1.f09_g16.X"], test_id=self._baseline_name, env_changes="NODEFAIL_NUM_FAILS=5", run_errors=True)
         rundir = run_cmd_no_fail("./xmlquery RUNDIR --value", from_dir=casedir)
         fail_sentinel = os.path.join(rundir, "FAIL_SENTINEL")
         self.assertTrue(os.path.exists(fail_sentinel), msg="Missing %s" % fail_sentinel)
@@ -1635,53 +1756,60 @@ class Q_TestBlessTestResults(TestCreateTestCommon):
     ###############################################################################
     def test_bless_test_results(self):
     ###############################################################################
-        # Generate some baselines
-        test_name = "TESTRUNDIFF_P1.f19_g16_rx1.A"
-
-        if CIME.utils.get_model() == "e3sm":
-            genargs = ["-g", "-o", "-b", self._baseline_name, test_name]
-            compargs = ["-c", "-b", self._baseline_name, test_name]
+        if (NO_FORTRAN_RUN):
+            self.skipTest("Skipping fortran test")
+        # Test resubmit scenario if Machine has a batch system
+        if MACHINE.has_batch_system():
+            test_names = ["TESTRUNDIFFRESUBMIT_P1.f19_g16_rx1.A", "TESTRUNDIFF_P1.f19_g16_rx1.A"]
         else:
-            genargs = ["-g", self._baseline_name, "-o", test_name,
-                       "--baseline-root ", self._baseline_area]
-            compargs = ["-c", self._baseline_name, test_name,
-                       "--baseline-root ", self._baseline_area]
-        self._create_test(genargs)
+            test_names = ["TESTRUNDIFF_P1.f19_g16_rx1.A"]
 
-        # Hist compare should pass
-        self._create_test(compargs)
+        # Generate some baselines
+        for test_name in test_names:
+            if CIME.utils.get_model() == "e3sm":
+                genargs = ["-g", "-o", "-b", self._baseline_name, test_name]
+                compargs = ["-c", "-b", self._baseline_name, test_name]
+            else:
+                genargs = ["-g", self._baseline_name, "-o", test_name,
+                           "--baseline-root ", self._baseline_area]
+                compargs = ["-c", self._baseline_name, test_name,
+                            "--baseline-root ", self._baseline_area]
 
-        # Change behavior
-        os.environ["TESTRUNDIFF_ALTERNATE"] = "True"
+            self._create_test(genargs)
+            # Hist compare should pass
+            self._create_test(compargs)
+            # Change behavior
+            os.environ["TESTRUNDIFF_ALTERNATE"] = "True"
 
-        # Hist compare should now fail
-        test_id = "%s-%s" % (self._baseline_name, CIME.utils.get_timestamp())
-        self._create_test(compargs, test_id=test_id, run_errors=True)
+            # Hist compare should now fail
+            test_id = "%s-%s" % (self._baseline_name, CIME.utils.get_timestamp())
+            self._create_test(compargs, test_id=test_id, run_errors=True)
 
-        # compare_test_results should detect the fail
-        cpr_cmd = "{}/compare_test_results --test-root {} -t {} 2>&1" \
-                  .format(TOOLS_DIR, self._testroot, test_id)
-        output = run_cmd_assert_result(self, cpr_cmd, expected_stat=CIME.utils.TESTS_FAILED_ERR_CODE)
+            # compare_test_results should detect the fail
+            cpr_cmd = "{}/compare_test_results --test-root {} -t {} 2>&1" \
+                    .format(TOOLS_DIR, self._testroot, test_id)
+            output = run_cmd_assert_result(self, cpr_cmd, expected_stat=CIME.utils.TESTS_FAILED_ERR_CODE)
 
-        # use regex
-        expected_pattern = re.compile(r'FAIL %s[^\s]* BASELINE' % test_name)
-        the_match = expected_pattern.search(output)
-        self.assertNotEqual(the_match, None,
-                            msg="Cmd '%s' failed to display failed test in output:\n%s" % (cpr_cmd, output))
-
-        # Bless
-        run_cmd_no_fail("{}/bless_test_results --test-root {} --hist-only --force -t {}"
-                        .format(TOOLS_DIR, self._testroot, test_id))
-
-        # Hist compare should now pass again
-        self._create_test(compargs)
-
-        verify_perms(self, self._baseline_area)
+            # use regex
+            expected_pattern = re.compile(r'FAIL %s[^\s]* BASELINE' % test_name)
+            the_match = expected_pattern.search(output)
+            self.assertNotEqual(the_match, None,
+                                msg="Cmd '%s' failed to display failed test %s in output:\n%s" % (cpr_cmd, test_name, output))
+            # Bless
+            run_cmd_no_fail("{}/bless_test_results --test-root {} --hist-only --force -t {}"
+                            .format(TOOLS_DIR, self._testroot, test_id))
+            # Hist compare should now pass again
+            self._create_test(compargs)
+            verify_perms(self, self._baseline_area)
+            if "TESTRUNDIFF_ALTERNATE" in os.environ:
+                del os.environ["TESTRUNDIFF_ALTERNATE"]
 
     ###############################################################################
     def test_rebless_namelist(self):
     ###############################################################################
         # Generate some namelist baselines
+        if (NO_FORTRAN_RUN):
+            self.skipTest("Skipping fortran test")
         test_to_change = "TESTRUNPASS_P1.f19_g16_rx1.A"
         if CIME.utils.get_model() == "e3sm":
             genargs = ["-n", "-g", "-o", "-b", self._baseline_name, "cime_test_only_pass"]
@@ -1694,11 +1822,10 @@ class Q_TestBlessTestResults(TestCreateTestCommon):
 
         # Basic namelist compare
         test_id = "%s-%s" % (self._baseline_name, CIME.utils.get_timestamp())
-        self._create_test(compargs, test_id=test_id)
+        cases = self._create_test(compargs, test_id=test_id)
+        casedir = get_casedir(self, test_to_change, cases)
 
         # Check standalone case.cmpgen_namelists
-        casedir = os.path.join(self._testroot,
-                               "%s.C.%s" % (CIME.utils.get_full_test_name(test_to_change, machine=self._machine, compiler=self._compiler), test_id))
         run_cmd_assert_result(self, "./case.cmpgen_namelists", from_dir=casedir)
 
         # compare_test_results should pass
@@ -1734,8 +1861,8 @@ class Q_TestBlessTestResults(TestCreateTestCommon):
         # Basic namelist compare should now fail
         test_id = "%s-%s" % (self._baseline_name, CIME.utils.get_timestamp())
         self._create_test(compargs, test_id=test_id, pre_run_errors=True)
-        casedir = os.path.join(self._testroot,
-                               "%s.C.%s" % (CIME.utils.get_full_test_name(test_to_change, machine=self._machine, compiler=self._compiler), test_id))
+        casedir = get_casedir(self, test_to_change, cases)
+
         run_cmd_assert_result(self, "./case.cmpgen_namelists", from_dir=casedir, expected_stat=100)
 
         # preview namelists should work
@@ -1779,6 +1906,38 @@ class X_TestQueryConfig(unittest.TestCase):
         run_cmd_no_fail("{}/query_config --machines".format(SCRIPT_DIR))
 
 ###############################################################################
+class Y_TestUserConcurrentMods(TestCreateTestCommon):
+###############################################################################
+
+    ###########################################################################
+    def test_user_concurrent_mods(self):
+    ###########################################################################
+        # Put this inside any test that's slow
+        if (FAST_ONLY):
+            self.skipTest("Skipping slow test")
+
+        casedir = self._create_test(["--walltime=0:30:00", "TESTRUNUSERXMLCHANGE_Mmpi-serial.f19_g16.X"], test_id=self._baseline_name)
+
+        with Timeout(3000):
+            while True:
+                with open(os.path.join(casedir, "CaseStatus"), "r") as fd:
+                    self._wait_for_tests(self._baseline_name)
+                    contents = fd.read()
+                    if contents.count("model execution success") == 2:
+                        break
+
+                time.sleep(5)
+
+        rundir = run_cmd_no_fail("./xmlquery RUNDIR --value", from_dir=casedir)
+        if CIME.utils.get_cime_default_driver() == 'nuopc':
+            chk_file = "nuopc.runconfig"
+        else:
+            chk_file = "drv_in"
+        with open(os.path.join(rundir, chk_file), "r") as fd:
+            contents = fd.read()
+            self.assertTrue("stop_n = 6" in contents)
+
+###############################################################################
 class Z_FullSystemTest(TestCreateTestCommon):
 ###############################################################################
 
@@ -1789,14 +1948,18 @@ class Z_FullSystemTest(TestCreateTestCommon):
         if (FAST_ONLY):
             self.skipTest("Skipping slow test")
 
-        self._create_test(["--walltime=0:15:00", "cime_developer"], test_id=self._baseline_name)
+        driver = CIME.utils.get_cime_default_driver()
+        if driver == "mct":
+            cases = self._create_test(["--walltime=0:15:00", "cime_developer"], test_id=self._baseline_name)
+        else:
+            cases = self._create_test(["--walltime=0:30:00", "cime_developer"], test_id=self._baseline_name)
 
         run_cmd_assert_result(self, "%s/cs.status.%s" % (self._testroot, self._baseline_name),
                               from_dir=self._testroot)
 
         # Ensure that we can get test times
-        test_statuses = glob.glob(os.path.join(self._testroot, "*%s" % self._baseline_name, "TestStatus"))
-        for test_status in test_statuses:
+        for case_dir in cases:
+            test_status = os.path.join(case_dir, "TestStatus")
             test_time = CIME.wait_for_tests.get_test_time(os.path.dirname(test_status))
             self.assertIs(type(test_time), int, msg="get time did not return int for %s" % test_status)
             self.assertTrue(test_time > 0, msg="test time was zero for %s" % test_status)
@@ -1804,7 +1967,7 @@ class Z_FullSystemTest(TestCreateTestCommon):
         # Test that re-running works
         tests = get_tests.get_test_suite("cime_developer", machine=self._machine, compiler=self._compiler)
         for test in tests:
-            casedir = os.path.join(self._testroot, "%s.%s" % (test, self._baseline_name))
+            casedir = get_casedir(self, test, cases)
 
             # Subtle issue: The run phases of these tests will be in the PASS state until
             # the submitted case.test script is run, which could take a while if the system is
@@ -1829,14 +1992,10 @@ class K_TestCimeCase(TestCreateTestCommon):
     ###########################################################################
     def test_cime_case(self):
     ###########################################################################
-        self._create_test(["--no-build", "TESTRUNPASS_P1.f19_g16_rx1.A"], test_id=self._baseline_name)
+        casedir = self._create_test(["--no-build", "TESTRUNPASS_P1.f19_g16_rx1.A"], test_id=self._baseline_name)
 
         self.assertEqual(type(MACHINE.get_value("MAX_TASKS_PER_NODE")), int)
         self.assertTrue(type(MACHINE.get_value("PROJECT_REQUIRED")) in [type(None) , bool])
-
-        casedir = os.path.join(self._testroot,
-                               "%s.%s" % (CIME.utils.get_full_test_name("TESTRUNPASS_P1.f19_g16_rx1.A", machine=self._machine, compiler=self._compiler), self._baseline_name))
-        self.assertTrue(os.path.isdir(casedir), msg="Missing casedir '%s'" % casedir)
 
         with Case(casedir, read_only=False) as case:
             build_complete = case.get_value("BUILD_COMPLETE")
@@ -1976,11 +2135,7 @@ class K_TestCimeCase(TestCreateTestCommon):
     ###########################################################################
     def test_cime_case_build_threaded_1(self):
     ###########################################################################
-        self._create_test(["--no-build", "TESTRUNPASS_P1x1.f19_g16_rx1.A"], test_id=self._baseline_name)
-
-        casedir = os.path.join(self._testroot,
-                               "%s.%s" % (CIME.utils.get_full_test_name("TESTRUNPASS_P1x1.f19_g16_rx1.A", machine=self._machine, compiler=self._compiler), self._baseline_name))
-        self.assertTrue(os.path.isdir(casedir), msg="Missing casedir '%s'" % casedir)
+        casedir = self._create_test(["--no-build", "TESTRUNPASS_P1x1.f19_g16_rx1.A"], test_id=self._baseline_name)
 
         with Case(casedir, read_only=False) as case:
             build_threaded = case.get_value("SMP_PRESENT")
@@ -1997,11 +2152,7 @@ class K_TestCimeCase(TestCreateTestCommon):
     ###########################################################################
     def test_cime_case_build_threaded_2(self):
     ###########################################################################
-        self._create_test(["--no-build", "TESTRUNPASS_P1x2.f19_g16_rx1.A"], test_id=self._baseline_name)
-
-        casedir = os.path.join(self._testroot,
-                               "%s.%s" % (CIME.utils.get_full_test_name("TESTRUNPASS_P1x2.f19_g16_rx1.A", machine=self._machine, compiler=self._compiler), self._baseline_name))
-        self.assertTrue(os.path.isdir(casedir), msg="Missing casedir '%s'" % casedir)
+        casedir = self._create_test(["--no-build", "TESTRUNPASS_P1x2.f19_g16_rx1.A"], test_id=self._baseline_name)
 
         with Case(casedir, read_only=False) as case:
             build_threaded = case.get_value("SMP_PRESENT")
@@ -2013,11 +2164,7 @@ class K_TestCimeCase(TestCreateTestCommon):
     ###########################################################################
     def test_cime_case_mpi_serial(self):
     ###########################################################################
-        self._create_test(["--no-build", "TESTRUNPASS_Mmpi-serial_P10.f19_g16_rx1.A"], test_id=self._baseline_name)
-
-        casedir = os.path.join(self._testroot,
-                               "%s.%s" % (CIME.utils.get_full_test_name("TESTRUNPASS_Mmpi-serial_P10.f19_g16_rx1.A", machine=self._machine, compiler=self._compiler), self._baseline_name))
-        self.assertTrue(os.path.isdir(casedir), msg="Missing casedir '%s'" % casedir)
+        casedir = self._create_test(["--no-build", "TESTRUNPASS_Mmpi-serial_P10.f19_g16_rx1.A"], test_id=self._baseline_name)
 
         with Case(casedir, read_only=True) as case:
 
@@ -2032,11 +2179,7 @@ class K_TestCimeCase(TestCreateTestCommon):
     ###########################################################################
     def test_cime_case_force_pecount(self):
     ###########################################################################
-        self._create_test(["--no-build", "--force-procs=16", "--force-threads=8", "TESTRUNPASS.f19_g16_rx1.A"], test_id=self._baseline_name)
-
-        casedir = os.path.join(self._testroot,
-                               "%s.%s" % (CIME.utils.get_full_test_name("TESTRUNPASS_P16x8.f19_g16_rx1.A", machine=self._machine, compiler=self._compiler), self._baseline_name))
-        self.assertTrue(os.path.isdir(casedir), msg="Missing casedir '%s'" % casedir)
+        casedir = self._create_test(["--no-build", "--force-procs=16", "--force-threads=8", "TESTRUNPASS.f19_g16_rx1.A"], test_id=self._baseline_name)
 
         with Case(casedir, read_only=True) as case:
             self.assertEqual(case.get_value("NTASKS_CPL"), 16)
@@ -2046,11 +2189,7 @@ class K_TestCimeCase(TestCreateTestCommon):
     ###########################################################################
     def test_cime_case_xmlchange_append(self):
     ###########################################################################
-        self._create_test(["--no-build", "TESTRUNPASS_P1x1.f19_g16_rx1.A"], test_id=self._baseline_name)
-
-        casedir = os.path.join(self._testroot,
-                               "%s.%s" % (CIME.utils.get_full_test_name("TESTRUNPASS_P1x1.f19_g16_rx1.A", machine=self._machine, compiler=self._compiler), self._baseline_name))
-        self.assertTrue(os.path.isdir(casedir), msg="Missing casedir '%s'" % casedir)
+        casedir = self._create_test(["--no-build", "TESTRUNPASS_P1x1.f19_g16_rx1.A"], test_id=self._baseline_name)
 
         run_cmd_assert_result(self, "./xmlchange --id PIO_CONFIG_OPTS --val='-opt1'", from_dir=casedir)
         result = run_cmd_assert_result(self, "./xmlquery --value PIO_CONFIG_OPTS", from_dir=casedir)
@@ -2067,19 +2206,14 @@ class K_TestCimeCase(TestCreateTestCommon):
             self.skipTest("Skipping walltime test. Depends on E3SM batch settings")
 
         test_name = "ERS.f19_g16_rx1.A"
-        machine, compiler = "blues", "gnu"
-        self._create_test(["--no-setup", "--machine={}".format(machine), test_name], test_id=self._baseline_name,
-                          env_changes="unset CIME_GLOBAL_WALLTIME &&")
-
-        casedir = os.path.join(self._testroot,
-                               "%s.%s" % (CIME.utils.get_full_test_name(test_name, machine=machine, compiler=compiler), self._baseline_name))
-        self.assertTrue(os.path.isdir(casedir), msg="Missing casedir '%s'" % casedir)
+        casedir = self._create_test(["--no-setup", "--machine=blues", test_name], test_id=self._baseline_name,
+                                    env_changes="unset CIME_GLOBAL_WALLTIME &&")
 
         result = run_cmd_assert_result(self, "./xmlquery JOB_WALLCLOCK_TIME --subgroup=case.test --value", from_dir=casedir)
-        self.assertEqual(result, "0:10:00")
+        self.assertEqual(result, "00:10:00")
 
         result = run_cmd_assert_result(self, "./xmlquery JOB_QUEUE --subgroup=case.test --value", from_dir=casedir)
-        self.assertEqual(result, "batch")
+        self.assertEqual(result, "biggpu")
 
     ###########################################################################
     def test_cime_case_test_walltime_mgmt_2(self):
@@ -2088,19 +2222,14 @@ class K_TestCimeCase(TestCreateTestCommon):
             self.skipTest("Skipping walltime test. Depends on E3SM batch settings")
 
         test_name = "ERS_P64.f19_g16_rx1.A"
-        machine, compiler = "blues", "gnu"
-        self._create_test(["--no-setup", "--machine={}".format(machine), test_name], test_id=self._baseline_name,
-                          env_changes="unset CIME_GLOBAL_WALLTIME &&")
-
-        casedir = os.path.join(self._testroot,
-                               "%s.%s" % (CIME.utils.get_full_test_name(test_name, machine=machine, compiler=compiler), self._baseline_name))
-        self.assertTrue(os.path.isdir(casedir), msg="Missing casedir '%s'" % casedir)
+        casedir = self._create_test(["--no-setup", "--machine=blues", test_name], test_id=self._baseline_name,
+                                    env_changes="unset CIME_GLOBAL_WALLTIME &&")
 
         result = run_cmd_assert_result(self, "./xmlquery JOB_WALLCLOCK_TIME --subgroup=case.test --value", from_dir=casedir)
-        self.assertEqual(result, "03:00:00")
+        self.assertEqual(result, "01:00:00")
 
         result = run_cmd_assert_result(self, "./xmlquery JOB_QUEUE --subgroup=case.test --value", from_dir=casedir)
-        self.assertEqual(result, "batch")
+        self.assertEqual(result, "biggpu")
 
     ###########################################################################
     def test_cime_case_test_walltime_mgmt_3(self):
@@ -2109,19 +2238,14 @@ class K_TestCimeCase(TestCreateTestCommon):
             self.skipTest("Skipping walltime test. Depends on E3SM batch settings")
 
         test_name = "ERS_P64.f19_g16_rx1.A"
-        machine, compiler = "blues", "gnu"
-        self._create_test(["--no-setup", "--machine={}".format(machine), "--walltime=0:10:00", test_name], test_id=self._baseline_name,
-                          env_changes="unset CIME_GLOBAL_WALLTIME &&")
-
-        casedir = os.path.join(self._testroot,
-                               "%s.%s" % (CIME.utils.get_full_test_name(test_name, machine=machine, compiler=compiler), self._baseline_name))
-        self.assertTrue(os.path.isdir(casedir), msg="Missing casedir '%s'" % casedir)
+        casedir = self._create_test(["--no-setup", "--machine=blues", "--walltime=0:10:00", test_name], test_id=self._baseline_name,
+                                    env_changes="unset CIME_GLOBAL_WALLTIME &&")
 
         result = run_cmd_assert_result(self, "./xmlquery JOB_WALLCLOCK_TIME --subgroup=case.test --value", from_dir=casedir)
-        self.assertEqual(result, "0:10:00")
+        self.assertEqual(result, "00:10:00")
 
         result = run_cmd_assert_result(self, "./xmlquery JOB_QUEUE --subgroup=case.test --value", from_dir=casedir)
-        self.assertEqual(result, "batch") # Not smart enough to select faster queue
+        self.assertEqual(result, "biggpu") # Not smart enough to select faster queue
 
     ###########################################################################
     def test_cime_case_test_walltime_mgmt_4(self):
@@ -2130,19 +2254,14 @@ class K_TestCimeCase(TestCreateTestCommon):
             self.skipTest("Skipping walltime test. Depends on E3SM batch settings")
 
         test_name = "ERS_P1.f19_g16_rx1.A"
-        machine, compiler = "blues", "gnu"
-        self._create_test(["--no-setup", "--machine={}".format(machine), "--walltime=2:00:00", test_name], test_id=self._baseline_name,
-                          env_changes="unset CIME_GLOBAL_WALLTIME &&")
-
-        casedir = os.path.join(self._testroot,
-                               "%s.%s" % (CIME.utils.get_full_test_name(test_name, machine=machine, compiler=compiler), self._baseline_name))
-        self.assertTrue(os.path.isdir(casedir), msg="Missing casedir '%s'" % casedir)
+        casedir = self._create_test(["--no-setup", "--machine=blues", "--walltime=2:00:00", test_name], test_id=self._baseline_name,
+                                    env_changes="unset CIME_GLOBAL_WALLTIME &&")
 
         result = run_cmd_assert_result(self, "./xmlquery JOB_WALLCLOCK_TIME --subgroup=case.test --value", from_dir=casedir)
-        self.assertEqual(result, "2:00:00")
+        self.assertEqual(result, "01:00:00")
 
         result = run_cmd_assert_result(self, "./xmlquery JOB_QUEUE --subgroup=case.test --value", from_dir=casedir)
-        self.assertEqual(result, "batch")
+        self.assertEqual(result, "biggpu")
 
     ###########################################################################
     def test_cime_case_test_walltime_mgmt_5(self):
@@ -2151,20 +2270,15 @@ class K_TestCimeCase(TestCreateTestCommon):
             self.skipTest("Skipping walltime test. Depends on E3SM batch settings")
 
         test_name = "ERS_P1.f19_g16_rx1.A"
-        machine, compiler = "blues", "gnu"
-        self._create_test(["--no-setup", "--machine={}".format(machine), test_name], test_id=self._baseline_name,
-                          env_changes="unset CIME_GLOBAL_WALLTIME &&")
-
-        casedir = os.path.join(self._testroot,
-                               "%s.%s" % (CIME.utils.get_full_test_name(test_name, machine=machine, compiler=compiler), self._baseline_name))
-        self.assertTrue(os.path.isdir(casedir), msg="Missing casedir '%s'" % casedir)
+        casedir = self._create_test(["--no-setup", "--machine=blues", test_name], test_id=self._baseline_name,
+                                    env_changes="unset CIME_GLOBAL_WALLTIME &&")
 
         run_cmd_assert_result(self, "./xmlchange JOB_QUEUE=slartibartfast --subgroup=case.test", from_dir=casedir, expected_stat=1)
 
         run_cmd_assert_result(self, "./xmlchange JOB_QUEUE=slartibartfast --force --subgroup=case.test", from_dir=casedir)
 
         result = run_cmd_assert_result(self, "./xmlquery JOB_WALLCLOCK_TIME --subgroup=case.test --value", from_dir=casedir)
-        self.assertEqual(result, "03:00:00")
+        self.assertEqual(result, "01:00:00")
 
         result = run_cmd_assert_result(self, "./xmlquery JOB_QUEUE --subgroup=case.test --value", from_dir=casedir)
         self.assertEqual(result, "slartibartfast")
@@ -2176,12 +2290,8 @@ class K_TestCimeCase(TestCreateTestCommon):
             self.skipTest("Skipping walltime test. Depends on batch system")
 
         test_name = "ERS_P1.f19_g16_rx1.A"
-        self._create_test(["--no-build", test_name], test_id=self._baseline_name,
-                          env_changes="unset CIME_GLOBAL_WALLTIME &&")
-
-        casedir = os.path.join(self._testroot,
-                               "%s.%s" % (CIME.utils.get_full_test_name(test_name, machine=self._machine, compiler=self._compiler), self._baseline_name))
-        self.assertTrue(os.path.isdir(casedir), msg="Missing casedir '%s'" % casedir)
+        casedir = self._create_test(["--no-build", test_name], test_id=self._baseline_name,
+                                    env_changes="unset CIME_GLOBAL_WALLTIME &&")
 
         run_cmd_assert_result(self, "./xmlchange JOB_WALLCLOCK_TIME=421:32:11 --subgroup=case.test", from_dir=casedir)
 
@@ -2202,12 +2312,8 @@ class K_TestCimeCase(TestCreateTestCommon):
             self.skipTest("Skipping walltime test. Depends on batch system")
 
         test_name = "ERS_P1.f19_g16_rx1.A"
-        self._create_test(["--no-build", "--walltime=01:00:00", test_name], test_id=self._baseline_name,
-                          env_changes="unset CIME_GLOBAL_WALLTIME &&")
-
-        casedir = os.path.join(self._testroot,
-                               "%s.%s" % (CIME.utils.get_full_test_name(test_name, machine=self._machine, compiler=self._compiler), self._baseline_name))
-        self.assertTrue(os.path.isdir(casedir), msg="Missing casedir '%s'" % casedir)
+        casedir = self._create_test(["--no-build", "--walltime=01:00:00", test_name], test_id=self._baseline_name,
+                                    env_changes="unset CIME_GLOBAL_WALLTIME &&")
 
         run_cmd_assert_result(self, "./xmlchange JOB_WALLCLOCK_TIME=421:32:11 --subgroup=case.test", from_dir=casedir)
 
@@ -2229,12 +2335,8 @@ class K_TestCimeCase(TestCreateTestCommon):
 
         test_name = "SMS_P25600.f19_g16_rx1.A"
         machine, compiler = "theta", "gnu"
-        self._create_test(["--no-setup", "--machine={}".format(machine), "--compiler={}".format(compiler), "--project e3sm", test_name], test_id=self._baseline_name,
-                          env_changes="unset CIME_GLOBAL_WALLTIME &&")
-
-        casedir = os.path.join(self._testroot,
-                               "%s.%s" % (CIME.utils.get_full_test_name(test_name, machine=machine, compiler=compiler), self._baseline_name))
-        self.assertTrue(os.path.isdir(casedir), msg="Missing casedir '%s'" % casedir)
+        casedir = self._create_test(["--no-setup", "--machine={}".format(machine), "--compiler={}".format(compiler), "--project e3sm", test_name], test_id=self._baseline_name,
+                                    env_changes="unset CIME_GLOBAL_WALLTIME &&")
 
         result = run_cmd_assert_result(self, "./xmlquery JOB_WALLCLOCK_TIME --subgroup=case.test --value", from_dir=casedir)
         self.assertEqual(result, "09:00:00")
@@ -2246,14 +2348,15 @@ class K_TestCimeCase(TestCreateTestCommon):
     def test_cime_case_test_custom_project(self):
     ###########################################################################
         test_name = "ERS_P1.f19_g16_rx1.A"
-        machine, compiler = "melvin", "gnu" # have to use a machine both models know and one that doesn't put PROJECT in any key paths
-        self._create_test(["--no-setup", "--machine={}".format(machine), "--compiler={}".format(compiler), "--project=testproj", test_name, "--mpilib=mpi-serial"],
-                          test_id=self._baseline_name,
-                          env_changes="unset CIME_GLOBAL_WALLTIME &&")
-
-        casedir = os.path.join(self._testroot,
-                               "%s.%s" % (CIME.utils.get_full_test_name(test_name, machine=machine, compiler=compiler), self._baseline_name))
-        self.assertTrue(os.path.isdir(casedir), msg="Missing casedir '%s'" % casedir)
+        # have to use a machine both models know and one that doesn't put PROJECT in any key paths
+        if CIME.utils.get_model() == "e3sm":
+            machine = "mappy"
+        else:
+            machine = "melvin"
+        compiler = "gnu"
+        casedir = self._create_test(["--no-setup", "--machine={}".format(machine), "--compiler={}".format(compiler), "--project=testproj", test_name, "--mpilib=mpi-serial"],
+                                    test_id=self._baseline_name,
+                                    env_changes="unset CIME_GLOBAL_WALLTIME &&")
 
         result = run_cmd_assert_result(self, "./xmlquery --value PROJECT --subgroup=case.test", from_dir=casedir)
         self.assertEqual(result, "testproj")
@@ -2266,14 +2369,10 @@ class K_TestCimeCase(TestCreateTestCommon):
     ###########################################################################
     def test_env_loading(self):
     ###########################################################################
-        if self._machine != "melvin":
-            self.skipTest("Skipping env load test - Only works on melvin")
+        if self._machine != "mappy":
+            self.skipTest("Skipping env load test - Only works on mappy")
 
-        self._create_test(["--no-build", "TESTRUNPASS.f19_g16_rx1.A"], test_id=self._baseline_name)
-
-        casedir = os.path.join(self._testroot,
-                               "%s.%s" % (CIME.utils.get_full_test_name("TESTRUNPASS.f19_g16_rx1.A", machine=self._machine, compiler=self._compiler), self._baseline_name))
-        self.assertTrue(os.path.isdir(casedir), msg="Missing casedir '%s'" % casedir)
+        casedir = self._create_test(["--no-build", "TESTRUNPASS.f19_g16_rx1.A"], test_id=self._baseline_name)
 
         with Case(casedir, read_only=True) as case:
             env_mach = case.get_env("mach_specific")
@@ -2325,11 +2424,7 @@ class K_TestCimeCase(TestCreateTestCommon):
     ###########################################################################
     def test_xml_caching(self):
     ###########################################################################
-        self._create_test(["--no-build", "TESTRUNPASS.f19_g16_rx1.A"], test_id=self._baseline_name)
-
-        casedir = os.path.join(self._testroot,
-                               "%s.%s" % (CIME.utils.get_full_test_name("TESTRUNPASS.f19_g16_rx1.A", machine=self._machine, compiler=self._compiler), self._baseline_name))
-        self.assertTrue(os.path.isdir(casedir), msg="Missing casedir '%s'" % casedir)
+        casedir = self._create_test(["--no-build", "TESTRUNPASS.f19_g16_rx1.A"], test_id=self._baseline_name)
 
         active = os.path.join(casedir, "env_run.xml")
         backup = os.path.join(casedir, "env_run.xml.bak")
@@ -2373,27 +2468,27 @@ class K_TestCimeCase(TestCreateTestCommon):
             self.assertEqual(case.get_value("RUN_TYPE"), "startup")
             case.set_value("RUN_TYPE", "branch")
 
-        # behind the back detection
+        # behind the back detection.
         with self.assertRaises(CIMEError):
             with Case(casedir, read_only=False) as case:
+                case.set_value("RUN_TYPE", "startup")
                 time.sleep(0.2)
                 safe_copy(backup, active)
 
         with Case(casedir, read_only=False) as case:
             case.set_value("RUN_TYPE", "branch")
 
-        with self.assertRaises(CIMEError):
-            with Case(casedir) as case:
-                time.sleep(0.2)
-                safe_copy(backup, active)
+        # If there's no modications within CIME, the files should not be written
+        # and therefore no timestamp check
+        with Case(casedir) as case:
+            time.sleep(0.2)
+            safe_copy(backup, active)
 
     ###########################################################################
     def test_configure(self):
     ###########################################################################
-        self._create_test(["SMS.f09_g16.X", "--no-build"], test_id=self._baseline_name)
-
-        casedir = os.path.join(self._testroot,
-                               "{}.{}".format(CIME.utils.get_full_test_name("SMS.f09_g16.X", machine=self._machine, compiler=self._compiler), self._baseline_name))
+        testname = "SMS.f09_g16.X"
+        casedir = self._create_test([testname, "--no-build"], test_id=self._baseline_name)
 
         manual_config_dir = os.path.join(casedir, "manual_config")
         os.mkdir(manual_config_dir)
@@ -2407,6 +2502,32 @@ class K_TestCimeCase(TestCreateTestCommon):
             man_env_contents = fd.read()
 
         self.assertEqual(case_env_contents, man_env_contents)
+
+    ###########################################################################
+    def test_self_build_cprnc(self):
+    ###########################################################################
+        if (NO_FORTRAN_RUN):
+            self.skipTest("Skipping fortran test")
+
+        testname = "ERS_Ln7.f19_g16_rx1.A"
+        casedir = self._create_test([testname, "--no-build"], test_id=self._baseline_name)
+
+        run_cmd_assert_result(self, "./xmlchange CCSM_CPRNC=this_is_a_broken_cprnc",
+                              from_dir=casedir)
+        run_cmd_assert_result(self, "./case.build", from_dir=casedir)
+        run_cmd_assert_result(self, "./case.submit", from_dir=casedir)
+
+        self._wait_for_tests(self._baseline_name, always_wait=True)
+
+    ###########################################################################
+    def test_case_clean(self):
+    ###########################################################################
+        testname = "ERS_Ln7.f19_g16_rx1.A"
+        casedir = self._create_test([testname, "--no-build"], test_id=self._baseline_name)
+
+        run_cmd_assert_result(self, "./case.setup --clean", from_dir=casedir)
+        run_cmd_assert_result(self, "./case.setup --clean", from_dir=casedir)
+        run_cmd_assert_result(self, "./case.setup", from_dir=casedir)
 
 ###############################################################################
 class X_TestSingleSubmit(TestCreateTestCommon):
@@ -2428,12 +2549,33 @@ class X_TestSingleSubmit(TestCreateTestCommon):
                           env_changes="unset CIME_GLOBAL_WALLTIME &&")
 
 ###############################################################################
+class G_TestBuildSystem(TestCreateTestCommon):
+###############################################################################
+
+    ###########################################################################
+    def test_clean_rebuild(self):
+    ###########################################################################
+        casedir = self._create_test(["--no-run", "SMS.f19_g16_rx1.A"], test_id=self._baseline_name)
+
+        # Clean a component and a sharedlib
+        run_cmd_assert_result(self, "./case.build --clean atm", from_dir=casedir)
+        run_cmd_assert_result(self, "./case.build --clean gptl", from_dir=casedir)
+
+        # Repeating should not be an error
+        run_cmd_assert_result(self, "./case.build --clean atm", from_dir=casedir)
+        run_cmd_assert_result(self, "./case.build --clean gptl", from_dir=casedir)
+
+        run_cmd_assert_result(self, "./case.build", from_dir=casedir)
+
+###############################################################################
 class L_TestSaveTimings(TestCreateTestCommon):
 ###############################################################################
 
     ###########################################################################
     def simple_test(self, manual_timing=False):
     ###########################################################################
+        if (NO_FORTRAN_RUN):
+            self.skipTest("Skipping fortran test")
         timing_flag = "" if manual_timing else "--save-timing"
         driver = CIME.utils.get_cime_default_driver()
         if driver == "mct":
@@ -2455,11 +2597,11 @@ class L_TestSaveTimings(TestCreateTestCommon):
 
         if manual_timing:
             run_cmd_assert_result(self, "cd %s && %s/save_provenance postrun" % (casedir, TOOLS_DIR))
-
         if CIME.utils.get_model() == "e3sm":
-            provenance_dirs = glob.glob(os.path.join(timing_dir, "performance_archive", getpass.getuser(), casename, lids[0] + "*"))
-            self.assertEqual(len(provenance_dirs), 1, msg="provenance dirs were missing")
-            verify_perms(self, timing_dir)
+            provenance_glob = os.path.join(timing_dir, "performance_archive", getpass.getuser(), casename, lids[0] + "*")
+            provenance_dirs = glob.glob(provenance_glob)
+            self.assertEqual(len(provenance_dirs), 1, msg="wrong number of provenance dirs, expected 1, got {}, looked for {}".format(provenance_dirs, provenance_glob))
+            verify_perms(self, ''.join(provenance_dirs))
 
     ###########################################################################
     def test_save_timings(self):
@@ -2472,6 +2614,17 @@ class L_TestSaveTimings(TestCreateTestCommon):
         self.simple_test(manual_timing=True)
 
     ###########################################################################
+    def _record_success(self, test_name, test_success, commit, exp_last_pass, exp_trans_fail, baseline_dir):
+    ###########################################################################
+        save_test_success(baseline_dir, None, test_name, test_success, force_commit_test=commit)
+        was_success, last_pass, trans_fail = get_test_success(baseline_dir, None, test_name, testing=True)
+        self.assertEqual(test_success, was_success, msg="Broken was_success {} {}".format(test_name, commit))
+        self.assertEqual(last_pass, exp_last_pass, msg="Broken last_pass {} {}".format(test_name, commit))
+        self.assertEqual(trans_fail, exp_trans_fail, msg="Broken trans_fail {} {}".format(test_name, commit))
+        if test_success:
+            self.assertEqual(exp_last_pass, commit, msg="Should never")
+
+    ###########################################################################
     def test_success_recording(self):
     ###########################################################################
         if CIME.utils.get_model() != "e3sm":
@@ -2482,75 +2635,40 @@ class L_TestSaveTimings(TestCreateTestCommon):
         baseline_dir = os.path.join(self._baseline_area, self._baseline_name)
 
         # Test initial state
-        was_success, trans_pass, trans_fail = get_test_success(baseline_dir, None, fake_test1, testing=True)
-        self.assertFalse(was_success, msg="Broken was_success 1.0")
-        self.assertEqual(trans_pass, None, msg="Broken trans_pass 1.0")
-        self.assertEqual(trans_fail, None, msg="Broken trans_fail 1.0")
+        was_success, last_pass, trans_fail = get_test_success(baseline_dir, None, fake_test1, testing=True)
+        self.assertFalse(was_success, msg="Broken initial was_success")
+        self.assertEqual(last_pass, None, msg="Broken initial last_pass")
+        self.assertEqual(trans_fail, None, msg="Broken initial trans_fail")
 
-        # Test first result
-        save_test_success(baseline_dir, None, fake_test1, False, force_commit_test="AAA")
-        was_success, trans_pass, trans_fail = get_test_success(baseline_dir, None, fake_test1, testing=True)
-        self.assertFalse(was_success, msg="Broken was_success 1.1")
-        self.assertEqual(trans_pass, None, msg="Broken trans_pass 1.1")
-        self.assertEqual(trans_fail, "AAA", msg="Broken trans_fail 1.1")
+        # Test first result (test1 fails, test2 passes)
+        #                    test_name , success, commit , expP , expTF, baseline)
+        self._record_success(fake_test1, False  , "AAA"  , None , "AAA", baseline_dir)
+        self._record_success(fake_test2, True   , "AAA"  , "AAA", None , baseline_dir)
 
-        save_test_success(baseline_dir, None, fake_test2, True, force_commit_test="AAA")
-        was_success, trans_pass, trans_fail = get_test_success(baseline_dir, None, fake_test2, testing=True)
-        self.assertTrue(was_success, msg="Broken was_success 2.1")
-        self.assertEqual(trans_pass, "AAA", msg="Broken trans_pass 2.1")
-        self.assertEqual(trans_fail, None, msg="Broken trans_fail 2.1")
+        # Test second result matches first (no transition) (test1 fails, test2 passes)
+        #                    test_name , success, commit , expP , expTF, baseline)
+        self._record_success(fake_test1, False  , "BBB"  , None , "AAA", baseline_dir)
+        self._record_success(fake_test2, True   , "BBB"  , "BBB", None , baseline_dir)
 
-        # Test second result matches first (no transition)
-        save_test_success(baseline_dir, None, fake_test1, False, force_commit_test="BBB")
-        was_success, trans_pass, trans_fail = get_test_success(baseline_dir, None, fake_test1, testing=True)
-        self.assertFalse(was_success, msg="Broken was_success 1.2")
-        self.assertEqual(trans_pass, None, msg="Broken trans_pass 1.2")
-        self.assertEqual(trans_fail, "AAA", msg="Broken trans_fail 1.2")
+        # Test transition to new state (first real transition) (test1 passes, test2 fails)
+        #                    test_name , success, commit , expP , expTF, baseline)
+        self._record_success(fake_test1, True   , "CCC"  , "CCC", "AAA", baseline_dir)
+        self._record_success(fake_test2, False  , "CCC"  , "BBB", "CCC", baseline_dir)
 
-        save_test_success(baseline_dir, None, fake_test2, True, force_commit_test="BBB")
-        was_success, trans_pass, trans_fail = get_test_success(baseline_dir, None, fake_test2, testing=True)
-        self.assertTrue(was_success, msg="Broken was_success 2.2")
-        self.assertEqual(trans_pass, "AAA", msg="Broken trans_pass 2.2")
-        self.assertEqual(trans_fail, None, msg="Broken trans_fail 2.2")
+        # Test transition to new state (second real transition) (test1 fails, test2 passes)
+        #                    test_name , success, commit , expP , expTF, baseline)
+        self._record_success(fake_test1, False  , "DDD"  , "CCC", "DDD", baseline_dir)
+        self._record_success(fake_test2, True   , "DDD"  , "DDD", "CCC", baseline_dir)
 
-        # Test transition to new state (first real transition)
-        save_test_success(baseline_dir, None, fake_test1, True, force_commit_test="CCC")
-        was_success, trans_pass, trans_fail = get_test_success(baseline_dir, None, fake_test1, testing=True)
-        self.assertTrue(was_success, msg="Broken was_success 1.3")
-        self.assertEqual(trans_pass, "CCC", msg="Broken trans_pass 1.3")
-        self.assertEqual(trans_fail, "AAA", msg="Broken trans_fail 1.3")
+        # Test final repeat (test1 fails, test2 passes)
+        #                    test_name , success, commit , expP , expTF, baseline)
+        self._record_success(fake_test1, False  , "EEE"  , "CCC", "DDD", baseline_dir)
+        self._record_success(fake_test2, True   , "EEE"  , "EEE", "CCC", baseline_dir)
 
-        save_test_success(baseline_dir, None, fake_test2, False, force_commit_test="CCC")
-        was_success, trans_pass, trans_fail = get_test_success(baseline_dir, None, fake_test2, testing=True)
-        self.assertFalse(was_success, msg="Broken was_success 2.3")
-        self.assertEqual(trans_pass, "AAA", msg="Broken trans_pass 2.3")
-        self.assertEqual(trans_fail, "CCC", msg="Broken trans_fail 2.3")
-
-        # Test transition to new state (second real transition)
-        save_test_success(baseline_dir, None, fake_test1, False, force_commit_test="DDD")
-        was_success, trans_pass, trans_fail = get_test_success(baseline_dir, None, fake_test1, testing=True)
-        self.assertFalse(was_success, msg="Broken was_success 1.4")
-        self.assertEqual(trans_pass, "CCC", msg="Broken trans_pass 1.4")
-        self.assertEqual(trans_fail, "DDD", msg="Broken trans_fail 1.4")
-
-        save_test_success(baseline_dir, None, fake_test2, True, force_commit_test="DDD")
-        was_success, trans_pass, trans_fail = get_test_success(baseline_dir, None, fake_test2, testing=True)
-        self.assertTrue(was_success, msg="Broken was_success 2.4")
-        self.assertEqual(trans_pass, "DDD", msg="Broken trans_pass 2.4")
-        self.assertEqual(trans_fail, "CCC", msg="Broken trans_fail 2.4")
-
-        # Test final repeat
-        save_test_success(baseline_dir, None, fake_test1, False, force_commit_test="EEE")
-        was_success, trans_pass, trans_fail = get_test_success(baseline_dir, None, fake_test1, testing=True)
-        self.assertFalse(was_success, msg="Broken was_success 1.5")
-        self.assertEqual(trans_pass, "CCC", msg="Broken trans_pass 1.5")
-        self.assertEqual(trans_fail, "DDD", msg="Broken trans_fail 1.5")
-
-        save_test_success(baseline_dir, None, fake_test2, True, force_commit_test="EEE")
-        was_success, trans_pass, trans_fail = get_test_success(baseline_dir, None, fake_test2, testing=True)
-        self.assertTrue(was_success, msg="Broken was_success 2.5")
-        self.assertEqual(trans_pass, "DDD", msg="Broken trans_pass 2.5")
-        self.assertEqual(trans_fail, "CCC", msg="Broken trans_fail 2.5")
+        # Test final transition (test1 passes, test2 fails)
+        #                    test_name , success, commit , expP , expTF, baseline)
+        self._record_success(fake_test1, True   , "FFF"  , "FFF", "DDD", baseline_dir)
+        self._record_success(fake_test2, False  , "FFF"  , "EEE", "FFF", baseline_dir)
 
 # Machinery for Macros generation tests.
 
@@ -3305,6 +3423,10 @@ class I_TestCMakeMacros(H_TestMakeMacros):
 class S_TestManageAndQuery(unittest.TestCase):
     """Tests various scripts to manage and query xml files"""
 
+    def setUp(self):
+        if CIME.utils.get_model() == "e3sm":
+            self.skipTest("Skipping XML test management tests. E3SM does not use this.")
+
     def _run_and_assert_query_testlist(self, extra_args=""):
         """Ensure that query_testlist runs successfully with the given extra arguments"""
         files = Files()
@@ -3377,10 +3499,15 @@ def write_provenance_info():
     if TEST_MPILIB is not None:
         logging.info("Testing mpilib = %s"% TEST_MPILIB)
     logging.info("Test root: %s" % TEST_ROOT)
-    logging.info("Test driver: %s\n" % CIME.utils.get_cime_default_driver())
+    logging.info("Test driver: %s" % CIME.utils.get_cime_default_driver())
+    logging.info("Python version {}\n".format(sys.version))
 
 def cleanup():
     # if the TEST_ROOT directory exists and is empty, remove it
+    testreporter = os.path.join(TEST_ROOT,"testreporter")
+    files = os.listdir(TEST_ROOT)
+    if len(files)==1 and os.path.isfile(testreporter):
+        os.unlink(testreporter)
     if os.path.exists(TEST_ROOT) and not os.listdir(TEST_ROOT):
         print("All pass, removing directory:", TEST_ROOT)
         os.rmdir(TEST_ROOT)
@@ -3395,6 +3522,7 @@ def _main_func(description):
     global TEST_ROOT
     global GLOBAL_TIMEOUT
     global NO_TEARDOWN
+    global NO_FORTRAN_RUN
     config = CIME.utils.get_cime_config()
 
     help_str = \
@@ -3424,6 +3552,10 @@ OR
     parser.add_argument("--no-batch", action="store_true",
                         help="Do not submit jobs to batch system, run locally."
                         " If false, will default to machine setting.")
+
+    parser.add_argument("--no-fortran-run", action="store_true",
+                        help="Do not run any fortran jobs. Implies --fast"
+                        " Used for github actions")
 
     parser.add_argument("--no-cmake", action="store_true",
                         help="Do not run cmake tests")
@@ -3456,6 +3588,11 @@ OR
     NO_CMAKE       = ns.no_cmake
     GLOBAL_TIMEOUT = ns.timeout
     NO_TEARDOWN    = ns.no_teardown
+    NO_FORTRAN_RUN = ns.no_fortran_run
+    if NO_FORTRAN_RUN:
+        FAST_ONLY = True
+
+    os.chdir(os.path.dirname(__file__))
 
     if ns.machine is not None:
         MACHINE = Machines(machine=ns.machine)

@@ -146,7 +146,11 @@ class TestScheduler(object):
 
         self._machobj = Machines(machine=machine_name)
 
-        self._model_build_cost = 4
+        if get_model() == "e3sm":
+            # Current build system is unlikely to be able to productively use more than 16 cores
+            self._model_build_cost = min(16, int((self._machobj.get_value("GMAKE_J") * 2) / 3) + 1)
+        else:
+            self._model_build_cost = 4
 
         # If user is forcing procs or threads, re-write test names to reflect this.
         if force_procs or force_threads:
@@ -199,17 +203,17 @@ class TestScheduler(object):
         else:
             self._parallel_jobs = parallel_jobs
 
+        logger.info("create_test will do up to {} tasks simultaneously".format(self._parallel_jobs))
+
         self._baseline_cmp_name = baseline_cmp_name # Implies comparison should be done if not None
         self._baseline_gen_name = baseline_gen_name # Implies generation should be done if not None
 
-        # Compute baseline_root
-        self._baseline_root = baseline_root if baseline_root is not None \
+        # Compute baseline_root. Need to set some properties on machobj in order for
+        # the baseline_root to resolve correctly.
+        self._machobj.set_value("COMPILER", self._compiler)
+        self._machobj.set_value("PROJECT", self._project)
+        self._baseline_root = os.path.abspath(baseline_root) if baseline_root is not None \
                               else self._machobj.get_value("BASELINE_ROOT")
-
-        if self._project is not None:
-            self._baseline_root = self._baseline_root.replace("$PROJECT", self._project)
-
-        self._baseline_root = os.path.abspath(self._baseline_root)
 
         if baseline_cmp_name or baseline_gen_name:
             if self._baseline_cmp_name:
@@ -247,6 +251,8 @@ class TestScheduler(object):
             self._proc_pool = int(pes * 1.25)
         else:
             self._proc_pool = int(proc_pool)
+
+        logger.info("create_test will use up to {} cores simultaneously".format(self._proc_pool))
 
         self._procs_avail = self._proc_pool
 
@@ -443,6 +449,7 @@ class TestScheduler(object):
         _, case_opts, grid, compset,\
             machine, compiler, test_mods = parse_test_name(test)
 
+        os.environ["FROM_CREATE_TEST"] = "True"
         create_newcase_cmd = "{} --case {} --res {} --compset {}"\
                              " --test".format(os.path.join(self._cime_root, "scripts", "create_newcase"),
                                               test_dir, grid, compset)
@@ -549,7 +556,7 @@ class TestScheduler(object):
     ###########################################################################
     def _xml_phase(self, test):
     ###########################################################################
-        test_case = parse_test_name(test)[0]
+        test_case,case_opts,_,_,_,compiler,_ = parse_test_name(test)
 
         # Create, fill and write an envtest object
         test_dir = self._get_test_dir(test)
@@ -558,8 +565,19 @@ class TestScheduler(object):
         # Determine list of component classes that this coupler/driver knows how
         # to deal with. This list follows the same order as compset longnames follow.
         files = Files(comp_interface=self._cime_driver)
-        drv_config_file = files.get_value("CONFIG_CPL_FILE")
+        ufs_driver = os.environ.get("UFS_DRIVER")
+        attribute = None
+        if ufs_driver:
+            attribute = {"component":ufs_driver}
+
+        drv_config_file = files.get_value("CONFIG_CPL_FILE", attribute=attribute)
+
+        if self._cime_driver == "nuopc" and not os.path.exists(drv_config_file):
+            drv_config_file = files.get_value("CONFIG_CPL_FILE", {"component":"cpl"})
+        expect(os.path.exists(drv_config_file),"File {} not found, cime driver {}".format(drv_config_file, self._cime_driver))
+
         drv_comp = Component(drv_config_file, "CPL")
+
         envtest.add_elements_by_group(files, {}, "env_test.xml")
         envtest.add_elements_by_group(drv_comp, {}, "env_test.xml")
         envtest.set_value("TESTCASE", test_case)
@@ -599,8 +617,9 @@ class TestScheduler(object):
         config_test = Tests()
         testnode = config_test.get_test_node(test_case)
         envtest.add_test(testnode)
-        # Determine the test_case from the test name
-        test_case, case_opts = parse_test_name(test)[:2]
+
+        if compiler == 'nag':
+            envtest.set_value("FORCE_BUILD_SMP","FALSE")
 
         # Determine case_opts from the test_case
         if case_opts is not None:
@@ -644,6 +663,7 @@ class TestScheduler(object):
                         envtest.set_test_parameter("NTASKS_"+comp, "1")
                         envtest.set_test_parameter("NTHRDS_"+comp, "1")
                         envtest.set_test_parameter("ROOTPE_"+comp, "0")
+                        envtest.set_test_parameter("PIO_TYPENAME", "netcdf")
 
                 elif (opt.startswith('I') or # Marker to distinguish tests with same name - ignored
                       opt.startswith('M') or # handled in create_newcase
@@ -803,7 +823,7 @@ class TestScheduler(object):
             return total_pes
 
         elif (phase == SHAREDLIB_BUILD_PHASE):
-            if self._cime_model == "cesm":
+            if self._cime_model != "e3sm":
                 # Will force serialization of sharedlib builds
                 # TODO - instead of serializing, compute all library configs needed and build
                 # them all in parallel

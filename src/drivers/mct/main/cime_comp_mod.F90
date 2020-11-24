@@ -21,9 +21,10 @@ module cime_comp_mod
   ! share code & libs
   !----------------------------------------------------------------------------
   use shr_kind_mod,      only: r8 => SHR_KIND_R8
+  use shr_kind_mod,      only: i8 => SHR_KIND_I8
   use shr_kind_mod,      only: cs => SHR_KIND_CS
   use shr_kind_mod,      only: cl => SHR_KIND_CL
-  use shr_sys_mod,       only: shr_sys_abort, shr_sys_flush
+  use shr_sys_mod,       only: shr_sys_abort, shr_sys_flush, shr_sys_irtc
   use shr_const_mod,     only: shr_const_cday
   use shr_file_mod,      only: shr_file_setLogLevel, shr_file_setLogUnit
   use shr_file_mod,      only: shr_file_setIO, shr_file_getUnit, shr_file_freeUnit
@@ -184,12 +185,17 @@ module cime_comp_mod
   ! --- timing routines ---
   use t_drv_timers_mod
 
+  ! --- control variables ---
+  use seq_flds_mod,  only   : rof_heat
+
   implicit none
 
   private
 
   ! public data
-  public  :: timing_dir, mpicom_GLOID
+  public  :: timing_dir
+  public  :: mpicom_GLOID
+  public  :: cime_pre_init2_lb
 
   ! public routines
   public  :: cime_pre_init1
@@ -372,6 +378,8 @@ module cime_comp_mod
   real(r8)      :: cktime_acc(10)    ! cktime accumulator array 1 = all, 2 = atm, etc
   integer       :: cktime_cnt(10)    ! cktime counter array
   real(r8)      :: max_cplstep_time
+  real(r8)      :: mpi_init_time     ! time elapsed in mpi_init call
+  real(r8)      :: cime_pre_init2_lb ! time elapsed in cime_pre_init2 call after call to t_initf
   character(CL) :: timing_file       ! Local path to tprof filename
   character(CL) :: timing_dir        ! timing directory
   character(CL) :: tchkpt_dir        ! timing checkpoint directory
@@ -408,6 +416,7 @@ module cime_comp_mod
   logical  :: iac_prognostic         ! .true.  => iac comp expects input
 
   logical  :: atm_c2_lnd             ! .true.  => atm to lnd coupling on
+  logical  :: atm_c2_rof             ! .true.  => atm to rof coupling on
   logical  :: atm_c2_ocn             ! .true.  => atm to ocn coupling on
   logical  :: atm_c2_ice             ! .true.  => atm to ice coupling on
   logical  :: atm_c2_wav             ! .true.  => atm to wav coupling on
@@ -440,6 +449,7 @@ module cime_comp_mod
 
   logical  :: areafact_samegrid      ! areafact samegrid flag
   logical  :: single_column          ! scm mode logical
+  logical  :: iop_mode               ! iop mode logical
   real(r8) :: scmlon                 ! single column lon
   real(r8) :: scmlat                 ! single column lat
   logical  :: aqua_planet            ! aqua planet mode
@@ -640,7 +650,7 @@ module cime_comp_mod
   character(*), parameter :: F01 = "('"//subname//" : ', A, 2i8, 3x, A )"
   character(*), parameter :: F0R = "('"//subname//" : ', A, 2g23.15 )"
   character(*), parameter :: FormatA = '(A,": =============== ", A44,          " ===============")'
-  character(*), parameter :: FormatD = '(A,": =============== ", A20,I10.8,I8,8x,   " ===============")'
+  character(*), parameter :: FormatD = '(A,": =============== ", A20,I10.8,I8,6x,   " ===============")'
   character(*), parameter :: FormatR = '(A,": =============== ", A31,F12.3,1x,  " ===============")'
   character(*), parameter :: FormatQ = '(A,": =============== ", A20,2F10.2,4x," ===============")'
   !===============================================================================
@@ -670,8 +680,18 @@ contains
     character(len=8) :: c_cpl_inst    ! coupler instance number
     character(len=8) :: c_cpl_npes    ! number of pes in coupler
 
+    integer(i8) :: beg_count          ! start time
+    integer(i8) :: end_count          ! end time
+    integer(i8) :: irtc_rate          ! factor to convert time to seconds
+    
+    beg_count = shr_sys_irtc(irtc_rate)
+    
     call mpi_init(ierr)
     call shr_mpi_chkerr(ierr,subname//' mpi_init')
+
+    end_count = shr_sys_irtc(irtc_rate)
+    mpi_init_time = real( (end_count-beg_count), r8)/real(irtc_rate, r8)
+    
     call mpi_comm_dup(MPI_COMM_WORLD, global_comm, ierr)
     call shr_mpi_chkerr(ierr,subname//' mpi_comm_dup')
 
@@ -974,6 +994,10 @@ contains
 
     real(r8), parameter :: epsilo = shr_const_mwwv/shr_const_mwdair
 
+    integer(i8) :: beg_count          ! start time
+    integer(i8) :: end_count          ! end time
+    integer(i8) :: irtc_rate          ! factor to convert time to seconds
+
     !----------------------------------------------------------
     !| Timer initialization (has to be after mpi init)
     !----------------------------------------------------------
@@ -984,6 +1008,24 @@ contains
          pethreads_GLOID )
     call t_initf(NLFileName, LogPrint=.true., mpicom=mpicom_GLOID, &
          MasterTask=iamroot_GLOID,MaxThreads=maxthreads)
+
+    !----------------------------------------------------------
+    !| Record timer parent/child relationships for what has
+    !  occurred previously. CPL:INIT timer is stopped in
+    !  cime_driver.
+    !----------------------------------------------------------
+    call t_startf('CPL:INIT')
+    call t_adj_detailf(+1)
+
+    call t_startf('CPL:cime_pre_init1')
+    call t_startstop_valsf('CPL:mpi_init', walltime=mpi_init_time)
+    call t_stopf('CPL:cime_pre_init1')
+
+    call t_startf('CPL:ESMF_Initialize')
+    call t_stopf('CPL:ESMF_Initialize')
+
+    call t_startf('CPL:cime_pre_init2')
+    beg_count = shr_sys_irtc(irtc_rate)
 
     if (iamin_CPLID) then
        call seq_io_cpl_init()
@@ -1006,6 +1048,7 @@ contains
     else
        call seq_infodata_init(infodata,nlfilename, GLOID, pioid)
     end if
+    call seq_infodata_GetData(infodata, cime_model=cime_model)
 
     !----------------------------------------------------------
     ! Read shr_flux  namelist settings
@@ -1054,6 +1097,7 @@ contains
          esp_present=esp_present                   , &
          iac_present=iac_present                   , &
          single_column=single_column               , &
+         iop_mode=iop_mode                         , &
          aqua_planet=aqua_planet                   , &
          cpl_seq_option=cpl_seq_option             , &
          drv_threading=drv_threading               , &
@@ -1269,6 +1313,7 @@ contains
        call seq_comm_getinfo(OCNID(ens1), mpicom=mpicom_OCNID)
 
        call shr_scam_checkSurface(scmlon, scmlat, &
+            iop_mode,                             &
             OCNID(ens1), mpicom_OCNID,            &
             lnd_present=lnd_present,              &
             ocn_present=ocn_present,              &
@@ -1288,6 +1333,21 @@ contains
     if(PIO_FILE_IS_OPEN(pioid)) then
        call pio_closefile(pioid)
     endif
+
+    call t_stopf('CPL:cime_pre_init2')
+
+    ! CPL:cime_pre_init2 timer elapsed time will be double counted
+    ! in cime_driver. Recording time spent in timer using shr_sys_irtc
+    ! so that this can be adjusted. Count is started inside the t_startf
+    ! call and stopped outside the t_stopf call to approximate the portion
+    ! of the cost of the two clocks in t_startf/t_stopf that is captured
+    ! by the cime_pre_init2 timer.
+    end_count = shr_sys_irtc(irtc_rate)
+    cime_pre_init2_lb = real( (end_count-beg_count), r8)/real(irtc_rate, r8)
+
+    call t_adj_detailf(-1)
+    ! Remember: CPL:INIT timer is still running, and needs to be stopped
+    ! in cime_driver.F90.
 
   end subroutine cime_pre_init2
 
@@ -1319,7 +1379,6 @@ contains
        write(logunit,F00) 'Initialize each component: atm, lnd, rof, ocn, ice, glc, wav, esp, iac'
        call shr_sys_flush(logunit)
     endif
-    call seq_infodata_GetData(infodata, cime_model=cime_model)
 
     call t_startf('CPL:comp_init_pre_all')
     call component_init_pre(atm, ATMID, CPLATMID, CPLALLATMID, infodata, ntype='atm')
@@ -1562,6 +1621,7 @@ contains
     ! derive coupling connection flags
 
     atm_c2_lnd = .false.
+    atm_c2_rof = .false.
     atm_c2_ocn = .false.
     atm_c2_ice = .false.
     atm_c2_wav = .false.
@@ -1589,6 +1649,8 @@ contains
 
     if (atm_present) then
        if (lnd_prognostic) atm_c2_lnd = .true.
+       if (lnd_present   ) atm_c2_lnd = .true. ! needed for aream initialization
+       if (rof_prognostic .and. rof_heat) atm_c2_rof = .true.
        if (ocn_prognostic) atm_c2_ocn = .true.
        if (ocn_present   ) atm_c2_ocn = .true. ! needed for aoflux calc if aoflux=ocn
        if (ice_prognostic) atm_c2_ice = .true.
@@ -1692,6 +1754,7 @@ contains
        write(logunit,F0L)'esp model prognostic  = ',esp_prognostic
 
        write(logunit,F0L)'atm_c2_lnd            = ',atm_c2_lnd
+       write(logunit,F0L)'atm_c2_rof            = ',atm_c2_rof
        write(logunit,F0L)'atm_c2_ocn            = ',atm_c2_ocn
        write(logunit,F0L)'atm_c2_ice            = ',atm_c2_ice
        write(logunit,F0L)'atm_c2_wav            = ',atm_c2_wav
@@ -1845,7 +1908,7 @@ contains
 
        call prep_ice_init(infodata, ocn_c2_ice, glc_c2_ice, glcshelf_c2_ice, rof_c2_ice )
 
-       call prep_rof_init(infodata, lnd_c2_rof)
+       call prep_rof_init(infodata, lnd_c2_rof, atm_c2_rof)
 
        call prep_glc_init(infodata, lnd_c2_glc, ocn_c2_glcshelf)
 
@@ -2342,6 +2405,7 @@ contains
 108 format( A, f10.2, A, i8.8)
 109 format( A, 2f10.3)
 
+    call t_startf ('CPL:cime_run_init')
     hashint = 0
 
     call seq_infodata_putData(infodata,atm_phase=1,lnd_phase=1,ocn_phase=1,ice_phase=1)
@@ -2366,8 +2430,29 @@ contains
 
     ! --- Write out performance data for initialization
     call seq_timemgr_EClockGetData( EClock_d, curr_ymd=ymd, curr_tod=tod)
+#ifndef CPL_BYPASS
+    ! Report on memory usage
+    ! (For now, just look at the first instance of each component)
+    if ( iamroot_CPLID .or. &
+         ocn(ens1)%iamroot_compid .or. &
+         atm(ens1)%iamroot_compid .or. &
+         lnd(ens1)%iamroot_compid .or. &
+         ice(ens1)%iamroot_compid .or. &
+         glc(ens1)%iamroot_compid .or. &
+         wav(ens1)%iamroot_compid .or. &
+         iac(ens1)%iamroot_compid) then
+       call shr_mem_getusage(msize,mrss,.true.)
+
+       write(logunit,105) ' memory_write: model date = ',ymd,tod, &
+            ' memory = ',msize,' MB (highwater)    ',mrss,' MB (usage)', &
+            '  (pe=',iam_GLOID,' comps=',trim(complist)//')'
+    endif
+#endif
+    ! Write out a timing file checkpoint
     write(timing_file,'(a,i8.8,a1,i5.5)') &
           trim(tchkpt_dir)//"/model_timing"//trim(cpl_inst_tag)//"_",ymd,"_",tod
+
+    call t_stopf ('CPL:cime_run_init')
 
     call t_set_prefixf("CPL:INIT_")
     call cime_write_performance_checkpoint(output_perf,timing_file,mpicom_GLOID)
@@ -3421,7 +3506,6 @@ contains
     character        :: date*8, time*10, zone*5
 
     !-------------------------------------------------------------------------------
-
     call date_and_time (date, time, zone, values)
     cdate(1:2) = date(5:6)
     cdate(3:3) = '/'
@@ -3440,7 +3524,7 @@ contains
     write(logunit,F00) '          github: http://esmci.github.io/cime/)             '
     write(logunit,F00) '     License information is available as a link from above  '
     write(logunit,F00) '------------------------------------------------------------'
-    write(logunit,F00) '                     MODEL ',cime_model
+    write(logunit,F00) '                     MODEL ',trim(cime_model)
     write(logunit,F00) '------------------------------------------------------------'
     write(logunit,F00) '                DATE ',cdate, ' TIME ', ctime
     write(logunit,F00) '------------------------------------------------------------'
@@ -3676,6 +3760,10 @@ contains
        call t_drvstartf ('CPL:ATMPOST',cplrun=.true.,barrier=mpicom_CPLID)
        if (drv_threading) call seq_comm_setnthreads(nthreads_CPLID)
 
+       if (atm_c2_rof) then
+          call prep_rof_accum_atm(timer='CPL:atmpost_acca2r')
+       endif
+
        call component_diag(infodata, atm, flow='c2x', comment= 'recv atm', &
             info_debug=info_debug, timer_diag='CPL:atmpost_diagav')
 
@@ -3888,7 +3976,7 @@ contains
 
        ! ocn prep-merge (cesm1_mod or cesm1_mod_tight)
        if (ocn_prognostic) then
-#if COMPARE_TO_NUOPC          
+#if COMPARE_TO_NUOPC
           !This is need to compare to nuopc
           if (.not. skip_ocean_run) then
              ! ocn prep-merge
@@ -3898,7 +3986,7 @@ contains
              ! Accumulate ocn inputs - form partial sum of tavg ocn inputs (virtual "send" to ocn)
              call prep_ocn_accum(timer='CPL:atmocnp_accum')
           end if
-#else 
+#else
           ! ocn prep-merge
           xao_ox => prep_aoflux_get_xao_ox()
           call prep_ocn_mrg(infodata, fractions_ox, xao_ox=xao_ox, timer_mrg='CPL:atmocnp_mrgx2o')
@@ -4044,7 +4132,7 @@ contains
             info_debug=info_debug, timer_diag='CPL:lndpost_diagav')
 
        ! Accumulate rof and glc inputs (module variables in prep_rof_mod and prep_glc_mod)
-       if (lnd_c2_rof) call prep_rof_accum(timer='CPL:lndpost_accl2r')
+       if (lnd_c2_rof) call prep_rof_accum_lnd(timer='CPL:lndpost_accl2r')
        if (lnd_c2_glc .or. do_hist_l2x1yrg) call prep_glc_accum_lnd(timer='CPL:lndpost_accl2g' )
        if (lnd_c2_iac) call prep_iac_accum(timer='CPL:lndpost_accl2z')
 
@@ -4178,7 +4266,6 @@ contains
 !----------------------------------------------------------------------------------
 
   subroutine cime_run_rof_setup_send()
-    
     !----------------------------------------------------
     ! rof prep-merge
     !----------------------------------------------------
@@ -4192,6 +4279,7 @@ contains
 
        if (lnd_c2_rof) call prep_rof_calc_l2r_rx(fractions_lx, timer='CPL:rofprep_lnd2rof')
 
+       if (atm_c2_rof) call prep_rof_calc_a2r_rx(timer='CPL:rofprep_atm2rof')
        call prep_rof_mrg(infodata, fractions_rx, timer_mrg='CPL:rofprep_mrgx2r', cime_model=cime_model)
 
        call component_diag(infodata, rof, flow='x2c', comment= 'send rof', &

@@ -1062,7 +1062,7 @@
 
   <entry id="GLC_GRID">
     <type>char</type>
-    <valid_values>gland20,gland10,gland5,gland5UM,gland4,mpas.aisgis20km,mpas.gis20km,mpas.ais20km,null</valid_values>
+    <valid_values>gland20,gland10,gland5,gland5UM,gland4,mpas.aisgis20km,mpas.gis20km,mpas.ais20km,mpas.gis1to10km,null</valid_values>
     <default_value>gland5UM</default_value>
     <group>build_grid</group>
     <file>env_build.xml</file>
@@ -1140,6 +1140,15 @@
     <group>build_grid</group>
     <file>env_build.xml</file>
     <desc>grid mask - DO NOT EDIT (for experts only)</desc>
+  </entry>
+
+  <entry id="IOP_MODE">
+    <type>logical</type>
+    <valid_values>TRUE,FALSE</valid_values>
+    <default_value>FALSE</default_value>
+    <group>run_domain</group>
+    <file>env_run.xml</file>
+    <desc>Propogate a single point to the global grid  - DO NOT EDIT (for experts only)</desc>
   </entry>
 
   <entry id="PTS_MODE">
@@ -1385,6 +1394,40 @@
     <group>run_domain</group>
     <file>env_run.xml</file>
     <desc>atm2lnd state mapping file decomp type</desc>
+  </entry>
+
+  <entry id="ATM2ROF_FMAPNAME">
+    <type>char</type>
+    <default_value>idmap_ignore</default_value>
+    <group>run_domain</group>
+    <file>env_run.xml</file>
+    <desc>atm2rof flux mapping file</desc>
+  </entry>
+
+  <entry id="ATM2ROF_FMAPTYPE">
+    <type>char</type>
+    <valid_values>X,Y</valid_values>
+    <default_value>X</default_value>
+    <group>run_domain</group>
+    <file>env_run.xml</file>
+    <desc>atm2rof flux mapping file decomp type</desc>
+  </entry>
+
+  <entry id="ATM2ROF_SMAPNAME">
+    <type>char</type>
+    <default_value>idmap_ignore</default_value>
+    <group>run_domain</group>
+    <file>env_run.xml</file>
+    <desc>atm2rof state mapping file</desc>
+  </entry>
+
+  <entry id="ATM2ROF_SMAPTYPE">
+    <type>char</type>
+    <valid_values>X,Y</valid_values>
+    <default_value>X</default_value>
+    <group>run_domain</group>
+    <file>env_run.xml</file>
+    <desc>atm2rof state mapping file decomp type</desc>
   </entry>
 
   <entry id="ATM2WAV_SMAPNAME">
@@ -1992,6 +2035,14 @@
     <desc>Machines directory location</desc>
   </entry>
 
+  <entry id="EXTRA_MACHDIR">
+    <type>char</type>
+    <default_value></default_value>
+    <group>case_def</group>
+    <file>env_case.xml</file>
+    <desc>Path to an extra directory containing supplementary machines files</desc>
+  </entry>
+
   <entry id="RUNDIR">
     <type>char</type>
     <default_value>$CIME_OUTPUT_ROOT/$CASE/run</default_value>
@@ -2388,7 +2439,7 @@
     <default_value>64</default_value>
     <group>run_pio</group>
     <file>env_run.xml</file>
-    <desc>pio rearranger communication max pending requests (io2comp) : -1 implies no bound on max pending requests </desc>
+    <desc>pio rearranger communication max pending requests (io2comp) : 0 implies that CIME internally calculates the value (= 64), -1 implies no bound on max pending requests </desc>
   </entry>
 
   <!-- Handshaking is a very bad idea for large process counts and for -->
@@ -2487,16 +2538,16 @@
      be computed based on PIO_NUMTASKS and number of compute tasks
     </desc>
     <values>
-      <value compclass="ATM"></value>
-      <value compclass="CPL"></value>
-      <value compclass="OCN"></value>
-      <value compclass="WAV"></value>
-      <value compclass="GLC"></value>
-      <value compclass="ICE"></value>
-      <value compclass="ROF"></value>
-      <value compclass="LND"></value>
-      <value compclass="ESP"></value>
-      <value compclass="IAC"></value>
+      <value compclass="ATM">$MAX_MPITASKS_PER_NODE</value>
+      <value compclass="CPL">$MAX_MPITASKS_PER_NODE</value>
+      <value compclass="OCN">$MAX_MPITASKS_PER_NODE</value>
+      <value compclass="WAV">$MAX_MPITASKS_PER_NODE</value>
+      <value compclass="GLC">$MAX_MPITASKS_PER_NODE</value>
+      <value compclass="ICE">$MAX_MPITASKS_PER_NODE</value>
+      <value compclass="ROF">$MAX_MPITASKS_PER_NODE</value>
+      <value compclass="LND">$MAX_MPITASKS_PER_NODE</value>
+      <value compclass="ESP">$MAX_MPITASKS_PER_NODE</value>
+      <value compclass="IAC">$MAX_MPITASKS_PER_NODE</value>
     </values>
   </entry>
 
@@ -2507,17 +2558,16 @@
     <file>env_run.xml</file>
     <desc>pio rearranger choice box=1, subset=2 </desc>
     <values>
-      <value>$PIO_VERSION</value>
-      <value compclass="ATM"></value>
-      <value compclass="CPL"></value>
-      <value compclass="OCN"></value>
-      <value compclass="WAV"></value>
-      <value compclass="GLC"></value>
-      <value compclass="ICE"></value>
-      <value compclass="ROF"></value>
-      <value compclass="LND"></value>
-      <value compclass="ESP"></value>
-      <value compclass="IAC"></value>
+      <value compclass="ATM">$PIO_VERSION</value>
+      <value compclass="CPL">$PIO_VERSION</value>
+      <value compclass="OCN">$PIO_VERSION</value>
+      <value compclass="WAV">$PIO_VERSION</value>
+      <value compclass="GLC">$PIO_VERSION</value>
+      <value compclass="ICE">$PIO_VERSION</value>
+      <value compclass="ROF">$PIO_VERSION</value>
+      <value compclass="LND">$PIO_VERSION</value>
+      <value compclass="ESP">$PIO_VERSION</value>
+      <value compclass="IAC">$PIO_VERSION</value>
     </values>
   </entry>
 
@@ -2711,7 +2761,7 @@
     <default_value>UNSET</default_value>
     <group>test</group>
     <file>env_test.xml</file>
-    <desc>standard full pathname of the cprnc executable</desc>
+    <desc>standard full pathname of the cprnc executable. One can skip defining the xml entry, CCSM_CPRNC, and the sharedlib build system will automatically build cprnc</desc>
   </entry>
 
   <!-- ===================================================================== -->

@@ -18,8 +18,11 @@ class Grids(GenericXML):
             infile = files.get_value("GRIDS_SPEC_FILE")
         logger.debug(" Grid specification file is {}".format(infile))
         schema = files.get_schema("GRIDS_SPEC_FILE")
+        try:
+            GenericXML.__init__(self, infile, schema)
+        except:
+            expect(False, "Could not initialize Grids")
 
-        GenericXML.__init__(self, infile, schema)
         self._version = self.get_version()
 
         self._comp_gridnames = self._get_grid_names()
@@ -70,7 +73,7 @@ class Grids(GenericXML):
         gridinfo.update(domains)
 
         # determine gridmaps given component_grids
-        gridmaps = self._get_gridmaps(component_grids, driver)
+        gridmaps = self._get_gridmaps(component_grids, driver, compset)
         gridinfo.update(gridmaps)
 
         return gridinfo
@@ -111,7 +114,7 @@ class Grids(GenericXML):
                 if compset_attrib and not_compset_attrib:
                     compset_match = re.search(compset_attrib, compset)
                     not_compset_match = re.search(not_compset_attrib, compset)
-                    if compset_match is not None and not_compset_match is not None:
+                    if compset_match is not None and not_compset_match is None:
                         foundcompset = True
                         model_gridnode = node
                         logger.debug("Found match for {} with compset_match {} and not_compset_match {}"
@@ -214,7 +217,6 @@ class Grids(GenericXML):
 
         for grid in grids:
             grid_name = component_grids[grid[1]]
-
             # Determine grid name with no nlev suffix if there is one
             grid_name_nonlev = grid_name
             levmatch = re.match(atmlevregex, grid_name)
@@ -276,7 +278,7 @@ class Grids(GenericXML):
 
         return domains
 
-    def _get_gridmaps(self, component_grids, driver):
+    def _get_gridmaps(self, component_grids, driver, compset):
         """
         set all mapping files for config_grids.xml v2 schema
         """
@@ -284,11 +286,36 @@ class Grids(GenericXML):
                  ("rof_grid","r%"), ("glc_grid","g%"), ("wav_grid","w%"), ("iac_grid","z%")]
         gridmaps = {}
 
-        # (1) set all possibly required gridmaps to idmap
+        # (1) set all possibly required gridmaps to 'idmap' for mct and 'unset/idmap' for nuopc
         required_gridmaps_node = self.get_child("required_gridmaps")
         required_gridmap_nodes = self.get_children("required_gridmap", root=required_gridmaps_node)
-        for node in required_gridmap_nodes:
-            gridmaps[self.text(node)] = "idmap"
+        tmp_gridmap_nodes = self.get_children("required_gridmap", root=required_gridmaps_node)
+        required_gridmap_nodes = []
+        for node in tmp_gridmap_nodes:
+            compset_att = self.get(node,"compset")
+            not_compset_att = self.get(node,"not_compset")
+            if compset_att and not compset_att in compset or \
+               not_compset_att and not_compset_att in compset:
+                continue
+            required_gridmap_nodes.append(node)
+            if driver == 'nuopc':
+                grid1_name = self.text(node)[0].lower() + '%'
+                grid2_name = self.text(node)[4].lower() + '%'
+                if grid1_name == 'o%':
+                    grid1_name = 'oi%'
+                if grid2_name == 'o%':
+                    grid2_name = 'oi%'
+                grid1 = component_grids[grid1_name]
+                grid2 = component_grids[grid2_name]
+                if grid1 == grid2:
+                    if grid1 != 'null' and grid2 != 'null':
+                        gridmaps[self.text(node)] = "idmap"
+                    else:
+                        gridmaps[self.text(node)] = "unset"
+                else:
+                    gridmaps[self.text(node)] = "unset"
+            else:
+                gridmaps[self.text(node)] = "idmap"
 
         # (2) determine values gridmaps for target grid
         for idx, grid in enumerate(grids):
@@ -337,7 +364,8 @@ class Grids(GenericXML):
                             if driver == "nuopc":
                                 gridmaps[self.text(node)] = 'unset'
                             else:
-                                logger.warning("Warning: missing non-idmap {} for {}, {} and {} {} ".format(self.text(node), grid1_name, grid1_value, grid2_name, grid2_value))
+                                logger.warning("Warning: missing non-idmap {} for {}, {} and {} {} ".
+                                               format(self.text(node), grid1_name, grid1_value, grid2_name, grid2_value))
 
         return gridmaps
 

@@ -34,7 +34,10 @@ module perf_mod
    use namelist_utils,    only: find_group_name
 #endif
    use mpi
-!-----------------------------------------------------------------------
+#if ( defined _OPENMP )
+   use omp_lib, only :  omp_in_parallel
+#endif
+!!-----------------------------------------------------------------------
 !- module boilerplate --------------------------------------------------
 !-----------------------------------------------------------------------
    implicit none
@@ -715,6 +718,9 @@ contains
    if (.not. timing_initialized) return
    if (timing_disable_depth > 0) return
 #ifdef NUOPC_INTERFACE
+#if ( defined _OPENMP )
+   if (omp_in_parallel()) return
+#endif
    cur_timing_depth = cur_timing_depth + 1
    if(cur_timing_depth > timer_depth_limit) return
 #ifdef DEBUG
@@ -789,7 +795,11 @@ contains
 !
    if (.not. timing_initialized) return
    if (timing_disable_depth > 0) return
-
+#ifdef NUOPC_INTERFACE
+#if ( defined _OPENMP )
+   if (omp_in_parallel()) return
+#endif
+#endif
 !$OMP MASTER
    if (perf_ovhd_measurement) then
 #ifdef HAVE_MPI
@@ -803,29 +813,32 @@ contains
    endif
 #ifdef NUOPC_INTERFACE
    cur_timing_depth = cur_timing_depth - 1
-   if(cur_timing_depth >= timer_depth_limit) return
+   if(cur_timing_depth < timer_depth_limit) then
 #else
 !$OMP END MASTER
 #endif
-   if ((perf_add_detail) .AND. (cur_timing_detail < 100)) then
-      write(cdetail,'(i2.2)') cur_timing_detail
-      str_length = min(SHR_KIND_CM-3,len_trim(event))
-      TIMERSTOP(event(1:str_length)//'_'//cdetail)
-   else
-      str_length = min(SHR_KIND_CM,len_trim(event))
-      TIMERSTOP(event(1:str_length))
-   endif
+      if ((perf_add_detail) .AND. (cur_timing_detail < 100)) then
+         write(cdetail,'(i2.2)') cur_timing_detail
+         str_length = min(SHR_KIND_CM-3,len_trim(event))
+         TIMERSTOP(event(1:str_length)//'_'//cdetail)
+      else
+         str_length = min(SHR_KIND_CM,len_trim(event))
+         TIMERSTOP(event(1:str_length))
+      endif
 #ifndef NUOPC_INTERFACE
 !$OMP MASTER
 #endif
-   if (perf_ovhd_measurement) then
+      if (perf_ovhd_measurement) then
 #ifdef HAVE_MPI
-      ovhd_stop = mpi_wtime()
+         ovhd_stop = mpi_wtime()
 #else
-      ierr = GPTLstamp(ovhd_stop, usr, sys)
+         ierr = GPTLstamp(ovhd_stop, usr, sys)
 #endif
-      perf_timing_ovhd = perf_timing_ovhd + ovhd_stop
+         perf_timing_ovhd = perf_timing_ovhd + ovhd_stop
+      endif
+#ifdef NUOPC_INTERFACE
    endif
+#endif
 !$OMP END MASTER
    return
    end subroutine t_stopf
@@ -940,11 +953,7 @@ contains
 !
 !---------------------------Externals-----------------------------------
 !
-#if ( defined _OPENMP )
-   logical omp_in_parallel
-   external omp_in_parallel
-#endif
-!
+
 !-----------------------------------------------------------------------
 !
    if (.not. timing_initialized) return
